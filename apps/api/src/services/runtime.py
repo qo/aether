@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -40,12 +41,41 @@ class RuntimeState:
     expected_packet_rate_hz: float = DEFAULT_EXPECTED_PACKET_RATE_HZ
     expected_rate_source: str = "default"
     last_frame_ts_host_ns: int = 0
+    # Set whenever the live source task fails to open or read the serial port.
+    # Cleared on successful frame ingest. Surfaced via /devices.rx.last_error
+    # so the UI can show "why" no frames are flowing.
+    last_source_error: str | None = None
+    last_source_error_kind: str | None = None
+    last_source_error_at_ns: int = 0
     _frames_seen: int = 0
     _windows_emitted: int = 0
     _window_frames: deque[RawCsiFrame] = field(default_factory=lambda: deque(maxlen=40))
     _biorhythm: BiorhythmEstimator = field(default_factory=BiorhythmEstimator)
     _calibrator: BaselineCalibrator = field(default_factory=BaselineCalibrator)
+    _calibration_was_accepted: bool = False
     link_stats: LinkStats = field(default_factory=LinkStats)
+
+    def __post_init__(self) -> None:
+        # Restore previously-captured calibration baseline from the store
+        # (item 8.2). Without this, every API restart loses the 10-30 s of
+        # baseline capture work — bad operator workflow. The persisted
+        # snapshot includes the Welford state so the restored calibrator
+        # behaves identically to one that just finished its own capture.
+        try:
+            stored = self.store.get_calibration()
+        except Exception:  # noqa: BLE001 — corrupted row is non-fatal
+            stored = None
+        if stored is not None:
+            _stage, payload = stored
+            self._calibrator = BaselineCalibrator.from_persisted_dict(payload)
+            self._calibration_was_accepted = self._calibrator.is_calibrated
+            if self._calibrator.is_calibrated:
+                logger.info(
+                    "[runtime] restored calibration baseline from store: "
+                    "subcarriers=%d frames=%d",
+                    self._calibrator.snapshot().subcarrier_count if self._calibrator.snapshot() else 0,
+                    self._calibrator.frames_observed,
+                )
 
     async def publish_frame(self, frame: RawCsiFrame) -> None:
         self.latest_raw = frame
@@ -53,6 +83,13 @@ class RuntimeState:
         self._window_frames.append(frame)
         self.store.append_raw_frame(frame)
         self._frames_seen += 1
+        # First successful frame after a serial-open failure clears the
+        # sticky error so the UI doesn't keep claiming the port is broken
+        # once it actually reconnected.
+        if self.last_source_error is not None:
+            self.last_source_error = None
+            self.last_source_error_kind = None
+            self.last_source_error_at_ns = 0
         # Phase A: feed link diagnostics (jitter, observed Hz, RSSI std).
         self.link_stats.record_frame(
             ts_host_ns=int(frame.ts_host_ns),
@@ -83,18 +120,42 @@ class RuntimeState:
         # Calibration: feed per-frame amplitude vector into the baseline accumulator.
         # Also pass RSSI + last-known motion so the calibrator can reject
         # baselines captured during noisy/active windows (Phase B acceptance).
+        # Post-calibration: feed "still" frames into the drift EWMA so the
+        # operator gets a heads-up when thermal/AGC drift has invalidated
+        # the baseline (item 8.3).
+        if self._calibrator.is_calibrated and not self._calibrator.is_calibrating:
+            last_motion = self.latest_window.motion_score if self.latest_window else None
+            if last_motion is not None and last_motion < 1.5:
+                amp = iq_array_to_amplitude(frame.raw_iq_int8)
+                if amp.size > 0:
+                    self._calibrator.feed_idle_amplitude(amp)
         if self._calibrator.is_calibrating:
             amp = iq_array_to_amplitude(frame.raw_iq_int8)
             if amp.size > 0:
                 last_motion = (
                     self.latest_window.motion_score if self.latest_window else None
                 )
-                self._calibrator.feed(
+                completed = self._calibrator.feed(
                     amp,
                     ts_host_ns=int(frame.ts_host_ns),
                     rssi_dbm=float(frame.rssi_dbm),
                     motion_score=last_motion,
                 )
+                # Persist the moment a baseline accepts (item 8.2). Reject
+                # cases stay in-memory so the operator can see the rejection
+                # reason; only accepted baselines write to disk.
+                if completed and self._calibrator.is_calibrated and not self._calibration_was_accepted:
+                    payload = self._calibrator.to_persisted_dict()
+                    if payload is not None:
+                        try:
+                            self.store.set_calibration(stage="still", payload=payload)
+                            logger.info(
+                                "[runtime] persisted calibration baseline (frames=%d)",
+                                self._calibrator.frames_observed,
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.exception("[runtime] persist calibration failed")
+                    self._calibration_was_accepted = True
 
         # Bio rhythm wants to know whether the subject is still and whether we
         # have an empty-room baseline so it can apply the stillness gate.
@@ -126,6 +187,8 @@ class RuntimeState:
             )
             window.heart_rate_proxy_tracked_bpm = reading.heart_rate_proxy_tracked_bpm
             window.fidget_score = reading.fidget_score
+            window.gait_score = reading.gait_score
+            window.gait_steps_per_min = reading.gait_steps_per_min
             window.biorhythm_window_seconds = reading.window_seconds
             window.biorhythm_sample_rate_hz = reading.sample_rate_hz
             window.biorhythm_signal_path = reading.signal_path
@@ -216,6 +279,14 @@ class RuntimeState:
 
     def reset_calibration(self) -> dict[str, object]:
         self._calibrator = BaselineCalibrator()
+        self._calibration_was_accepted = False
+        # Clear the persisted baseline too; otherwise a restart would
+        # silently restore the old one and the operator's reset wouldn't
+        # stick across processes.
+        try:
+            self.store.clear_calibration()
+        except Exception:  # noqa: BLE001
+            logger.exception("[runtime] clear_calibration failed")
         return self._calibrator.status()
 
     def record_firmware_heartbeat(
@@ -308,6 +379,13 @@ class RuntimeState:
                             dropped=message.get("dropped"),
                             queue_depth=message.get("queue_depth"),
                         )
+                    elif isinstance(message, dict) and message.get("type") == "source_error":
+                        # Source error: capture so /devices can surface "why".
+                        # The reader keeps retrying internally, so this is a
+                        # status, not a fatal — we don't break the loop.
+                        self.last_source_error = str(message.get("error", ""))
+                        self.last_source_error_kind = str(message.get("kind", "unknown"))
+                        self.last_source_error_at_ns = time.time_ns()
             except Exception:
                 logger.exception("live source task failed (port=%s)", port)
                 self.running = False

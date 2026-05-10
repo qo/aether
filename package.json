@@ -11,7 +11,7 @@
     "dev": "npm run dev --workspace @aether/web",
     "web:dev": "npm run dev --workspace @aether/web",
     "web:build": "npm run build --workspace @aether/web",
-    "api:dev": "python -m uvicorn apps.api.src.main:app --reload --host 127.0.0.1 --port 8000",
+    "api:dev": "python -m uvicorn apps.api.src.main:app --reload --host 127.0.0.1 --port 8000 --ws-ping-interval 30 --ws-ping-timeout 30",
     "test": "npm run test:protocol && npm run check:no-fake-data",
     "test:protocol": "node tests/e2e/protocol-schema.test.mjs",
     "check:no-fake-data": "node scripts/no_nonreal_data_check.mjs",

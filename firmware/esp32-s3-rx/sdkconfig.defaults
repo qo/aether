@@ -3,3 +3,24 @@ CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 CONFIG_LWIP_SO_REUSE=y
+
+# --- Serial throughput ----------------------------------------------------
+# At the previous default of 115200 baud the UART carried ~11.5 KB/s. A
+# JSON-encoded CSI frame (≤384 bytes I/Q, ASCII-expanded as "[-128,...]")
+# is ~1700 bytes — capping the link at ~6.7 frames/s. Wi-Fi delivers CSI
+# at the TX cadence (20 Hz), so the firmware queue overflowed and ~62%
+# of frames were dropped before they reached the host. Raising the
+# console UART to 921600 baud gives ~92 KB/s, an 8x lift. CP2102N /
+# CH9102 / CH340E (the USB-UART bridges shipped on common ESP32-S3 dev
+# boards) all support 921600 reliably; if your bridge does not, drop
+# this back to 460800.
+#
+# IMPORTANT: the host must also speak 921600 — see AETHER_BAUD in .env.
+# A baud mismatch produces unreadable garbage on the wire, not a clean
+# error. After flashing, restart the API so it picks up the new baud.
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
+CONFIG_ESPTOOLPY_MONITOR_BAUD_OTHER_VAL=921600
+
+# Larger UART TX ring so the printf/uart_write_bytes path doesn't block
+# the serial task while the FIFO drains.
+CONFIG_ESP_CONSOLE_UART_TX_BUFFER_SIZE=2048

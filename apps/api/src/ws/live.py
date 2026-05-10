@@ -114,22 +114,61 @@ async def live_websocket(websocket: WebSocket, state: RuntimeState) -> None:
             logger.info("[ws] %s hello sent (derived window available)", client)
 
         # Subscribe to both buses concurrently so raw and derived flow in
-        # parallel rather than blocking each other.
-        derived_iter = state.derived_bus.subscribe()
-        raw_iter = state.raw_bus.subscribe()
+        # parallel rather than blocking each other. We use the
+        # subscribe_with_handle path so backpressure drops are visible:
+        # the per-subscriber `lag` counter increments whenever the bus
+        # had to drop a queued item to make room. We forward that to the
+        # client on the next derived_window so a slow tab can show a
+        # "lagged N frames" hint instead of silently missing data.
+        derived_iter, derived_handle = state.derived_bus.subscribe_with_handle()
+        raw_iter, raw_handle = state.raw_bus.subscribe_with_handle()
+
+        # Shared "we're done" flag. The first pump that sees a closed socket
+        # flips this so the other stops trying to send. Without it, when one
+        # send_json races with the close, the other keeps writing to a closed
+        # connection and Starlette/uvicorn raise the noisy "ASGI send after
+        # close" RuntimeError that filled the operator's log.
+        closed = asyncio.Event()
+
+        async def safe_send(payload: dict[str, Any]) -> bool:
+            """Send a JSON payload; on disconnect, flip `closed` and return False.
+
+            Callers must check the return value and break out of their loop.
+            """
+            if closed.is_set():
+                return False
+            try:
+                await websocket.send_json(payload)
+                return True
+            except WebSocketDisconnect:
+                closed.set()
+                return False
+            except RuntimeError:
+                # Starlette raises RuntimeError("Cannot call send once the
+                # connection has been closed") and uvicorn raises a similar
+                # one for "ASGI send after close". Treat both as a clean
+                # disconnect rather than crashing the handler.
+                closed.set()
+                return False
 
         async def pump_derived() -> None:
             nonlocal sent, last_report_at, last_report_count
             async for window in derived_iter:
+                if closed.is_set():
+                    break
                 if "derived_window" not in topics:
                     continue
-                await websocket.send_json(
-                    {
-                        "type": "derived_window",
-                        "window": window.model_dump(mode="json"),
-                        "summary": state.live_summary(),
-                    }
-                )
+                lag = derived_handle.take_lag()
+                payload: dict[str, Any] = {
+                    "type": "derived_window",
+                    "window": window.model_dump(mode="json"),
+                    "summary": state.live_summary(),
+                }
+                if lag:
+                    payload["lag"] = lag
+                ok = await safe_send(payload)
+                if not ok:
+                    break
                 sent += 1
                 now = time.monotonic()
                 if now - last_report_at >= _RATE_WINDOW_SECONDS:
@@ -148,6 +187,8 @@ async def live_websocket(websocket: WebSocket, state: RuntimeState) -> None:
         async def pump_raw() -> None:
             nonlocal last_raw_emit
             async for frame in raw_iter:
+                if closed.is_set():
+                    break
                 if "raw_frame" not in topics:
                     continue
                 now = time.monotonic()
@@ -155,19 +196,26 @@ async def live_websocket(websocket: WebSocket, state: RuntimeState) -> None:
                     continue
                 last_raw_emit = now
                 amp, phase = _amp_phase_for(frame)
-                await websocket.send_json(
-                    {
-                        "type": "raw_frame",
-                        "frame": frame.model_dump(mode="json"),
-                        "derived": {
-                            "amplitude": amp,
-                            "phase": phase,
-                            "subcarrier_count": len(amp),
-                        },
-                    }
-                )
+                lag = raw_handle.take_lag()
+                payload: dict[str, Any] = {
+                    "type": "raw_frame",
+                    "frame": frame.model_dump(mode="json"),
+                    "derived": {
+                        "amplitude": amp,
+                        "phase": phase,
+                        "subcarrier_count": len(amp),
+                    },
+                }
+                if lag:
+                    payload["lag"] = lag
+                ok = await safe_send(payload)
+                if not ok:
+                    break
 
-        await asyncio.gather(pump_derived(), pump_raw())
+        # return_exceptions=True so a hiccup in one pump (e.g. an unexpected
+        # JSON-encoding error) cannot cancel the other mid-send and trigger
+        # the ASGI race we are paid to avoid.
+        await asyncio.gather(pump_derived(), pump_raw(), return_exceptions=True)
     except WebSocketDisconnect as exc:
         elapsed = time.monotonic() - started
         logger.info(

@@ -82,6 +82,15 @@ class DerivedWindow(StrictModel):
     heart_rate_proxy_harmonic_prominence: float | None = None
     heart_rate_proxy_tracked_bpm: float | None = Field(default=None, ge=0)
     fidget_score: float | None = Field(default=None, ge=0, le=1)
+    # Walking-cadence band 1.5-3 Hz (typical step rate). gait_score is the
+    # fraction of total motion-band energy in this band; gait_steps_per_min
+    # is the spectral peak frequency expressed as steps/minute. Both are
+    # [Inference] — CSI sees motion, not feet — but a sustained peak in
+    # 1.5-3 Hz with low respiration energy is the cleanest CSI signature
+    # of a person walking through the link. Optional for back-compat with
+    # older replays.
+    gait_score: float | None = Field(default=None, ge=0, le=1)
+    gait_steps_per_min: float | None = Field(default=None, ge=0)
     biorhythm_window_seconds: float | None = Field(default=None, ge=0)
     biorhythm_sample_rate_hz: float | None = Field(default=None, ge=0)
     biorhythm_signal_path: str | None = None

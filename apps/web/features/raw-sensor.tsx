@@ -197,7 +197,7 @@ function LinkDiagnosticsCard() {
               link.firmware_queue_depth == null
                 ? "no heartbeat"
                 : link.firmware_queue_depth > 4
-                ? "host not draining"
+                ? "firmware-side backlog (UART-bound)"
                 : "ok"
             }
             tone={

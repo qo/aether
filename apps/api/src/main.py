@@ -57,6 +57,13 @@ async def _startup() -> None:
 async def shutdown() -> None:
     logger.info("[boot] shutdown: stopping runtime tasks")
     await state.stop()
+    # Flush JSONL handles and close the SQLite connection. Without this,
+    # in-flight buffered raw/derived writes can be lost on a clean
+    # shutdown — most journals would not notice but it bites at demo time.
+    try:
+        store.close()
+    except Exception:  # noqa: BLE001
+        logger.exception("[boot] shutdown: store.close() failed")
     logger.info("[boot] shutdown complete")
 
 

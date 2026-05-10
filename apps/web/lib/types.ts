@@ -30,6 +30,8 @@ export interface DerivedWindow {
   heart_rate_proxy_harmonic_prominence?: number | null;
   heart_rate_proxy_tracked_bpm?: number | null;
   fidget_score: number | null;
+  gait_score?: number | null;
+  gait_steps_per_min?: number | null;
   biorhythm_window_seconds: number | null;
   biorhythm_sample_rate_hz: number | null;
   biorhythm_signal_path?: string | null;
@@ -54,6 +56,13 @@ export interface CalibrationStatus {
   progress: number;
   last_rejection_reason?: string | null;
   accepted?: boolean;
+  // Item 8.3: post-calibration drift detection. drift_score is RMS-relative
+  // amplitude divergence from baseline (0 = no drift); drift_detected is
+  // true once enough still samples have been gathered AND drift exceeds
+  // the warn threshold.
+  drift_score?: number;
+  drift_samples?: number;
+  drift_detected?: boolean;
 }
 
 export interface RoomGeometry {

@@ -1,10 +1,10 @@
 "use client";
 
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 import type { DerivedWindow } from "../lib/types";
 import { EmptyState } from "./empty-state";
 
-export function SubcarrierBars({
+function SubcarrierBarsImpl({
   windows,
   metric = "amplitude_std",
   height = 96
@@ -54,3 +54,12 @@ export function SubcarrierBars({
     </div>
   );
 }
+
+export const SubcarrierBars = memo(SubcarrierBarsImpl, (prev, next) => {
+  if (prev.height !== next.height || prev.metric !== next.metric) return false;
+  if (prev.windows.length !== next.windows.length) return false;
+  if (prev.windows.length === 0) return true;
+  const a = prev.windows[prev.windows.length - 1];
+  const b = next.windows[next.windows.length - 1];
+  return a?.window_end_ns === b?.window_end_ns;
+});

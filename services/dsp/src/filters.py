@@ -17,6 +17,8 @@ All functions take and return numpy arrays. They never silently drop samples.
 """
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 from scipy.signal import butter, filtfilt
 
@@ -90,19 +92,48 @@ def detrend_columns(matrix: np.ndarray) -> np.ndarray:
     return out
 
 
-def _design_butter(sample_rate_hz: float, low_hz: float | None, high_hz: float | None, order: int) -> tuple:
-    nyq = 0.5 * sample_rate_hz
-    if low_hz is not None and low_hz <= 0:
-        low_hz = None
+@lru_cache(maxsize=64)
+def _design_butter_cached(
+    sample_rate_key: float,
+    low_key: float | None,
+    high_key: float | None,
+    order: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Internal cache. Inputs must already be rounded so equal calls hit."""
+    nyq = 0.5 * sample_rate_key
+    low_hz = low_key
+    high_hz = high_key
     if high_hz is not None and high_hz >= nyq:
         high_hz = nyq * 0.999
     if low_hz is not None and high_hz is not None:
-        return butter(order, [low_hz / nyq, high_hz / nyq], btype="band")
-    if low_hz is not None:
-        return butter(order, low_hz / nyq, btype="highpass")
-    if high_hz is not None:
-        return butter(order, high_hz / nyq, btype="lowpass")
-    raise ValueError("at least one of low_hz or high_hz must be set")
+        b, a = butter(order, [low_hz / nyq, high_hz / nyq], btype="band")
+    elif low_hz is not None:
+        b, a = butter(order, low_hz / nyq, btype="highpass")
+    elif high_hz is not None:
+        b, a = butter(order, high_hz / nyq, btype="lowpass")
+    else:
+        raise ValueError("at least one of low_hz or high_hz must be set")
+    return b, a
+
+
+def _design_butter(sample_rate_hz: float, low_hz: float | None, high_hz: float | None, order: int) -> tuple:
+    """Design a Butterworth filter with results cached per (rate, band, order).
+
+    The DSP loop calls this 2-3 times per derived window with the same
+    parameters every call (sample rate adopts the observed value once and
+    stays fixed; band edges and order are constants). Caching the design
+    skips ~50-200 µs of polynomial root-finding per invocation, which adds
+    up over a 20 Hz cadence.
+
+    Keys are rounded so floating-point jitter in observed_rate doesn't
+    blow the cache: sample rate to 0.1 Hz, band edges to 0.01 Hz.
+    """
+    rate_key = round(float(sample_rate_hz), 1)
+    if low_hz is not None and low_hz <= 0:
+        low_hz = None
+    low_key = round(float(low_hz), 4) if low_hz is not None else None
+    high_key = round(float(high_hz), 4) if high_hz is not None else None
+    return _design_butter_cached(rate_key, low_key, high_key, int(order))
 
 
 def butter_filter_1d(

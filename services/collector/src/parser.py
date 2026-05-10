@@ -7,6 +7,23 @@ from typing import Any, Literal
 
 from aether_protocol import RawCsiFrame, SourceMode
 
+# orjson is ~3-5x faster than the stdlib json module for the kind of CSI
+# envelopes we parse here (one ~1700-byte JSON object per CSI frame). It's
+# a hard dependency in pyproject.toml; we still try-import so a stripped-
+# down dev environment without compiled wheels can fall back gracefully.
+try:
+    import orjson  # type: ignore
+
+    def _loads(text: str) -> Any:
+        return orjson.loads(text)
+
+    _DECODE_ERROR: tuple[type[Exception], ...] = (orjson.JSONDecodeError, ValueError)
+except ImportError:  # pragma: no cover — fallback path for stripped envs
+    def _loads(text: str) -> Any:
+        return json.loads(text)
+
+    _DECODE_ERROR = (json.JSONDecodeError, ValueError)
+
 
 @dataclass(frozen=True)
 class ParsedSerialMessage:
@@ -29,8 +46,8 @@ def parse_serial_line(
         raise SerialParseError("empty serial line")
 
     try:
-        envelope = json.loads(text)
-    except json.JSONDecodeError as exc:
+        envelope = _loads(text)
+    except _DECODE_ERROR as exc:
         raise SerialParseError(f"invalid JSON serial line: {exc}") from exc
 
     if not isinstance(envelope, dict):

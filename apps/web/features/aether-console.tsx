@@ -3,7 +3,7 @@
 import type { ColumnDef } from "@tanstack/react-table";
 import { Bell, RefreshCw, Square, Waves } from "lucide-react";
 import type { ReactNode } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { AmplitudeChart } from "../components/amplitude-chart";
 import { ConfidenceBadge } from "../components/confidence-badge";
@@ -30,10 +30,13 @@ import {
   getRoomSummary,
   getSessionSummary,
   getSessions,
+  listPresets,
   resetCalibration,
   startCalibration,
+  startPreset,
   startSession,
-  stopSession
+  stopSession,
+  type DemoPreset
 } from "../lib/api";
 import type { CalibrationStatus, DerivedWindow, RoomSummary, SessionRecord, SourceMode } from "../lib/types";
 
@@ -55,9 +58,9 @@ const trendSeries: TrendSeries[] = [
 
 const biorhythmSeries: TrendSeries[] = [
   { label: "Respiration (bpm)", stroke: "#14B8A6", pick: (w) => w.respiration_bpm, scale: "bpm" },
-  { label: "HR proxy (bpm)", stroke: "#EF4444", pick: (w) => w.heart_rate_proxy_bpm, scale: "bpm" },
+  { label: "Motion peak 0.8–2.5 Hz", stroke: "#EF4444", pick: (w) => w.heart_rate_proxy_bpm, scale: "bpm" },
   { label: "Resp confidence", stroke: "#3B82F6", pick: (w) => w.respiration_confidence ?? null, dash: [4, 3] },
-  { label: "HR confidence", stroke: "#F59E0B", pick: (w) => w.heart_rate_proxy_confidence ?? null, dash: [4, 3] }
+  { label: "Motion-peak confidence", stroke: "#F59E0B", pick: (w) => w.heart_rate_proxy_confidence ?? null, dash: [4, 3] }
 ];
 
 const protocolDefinitions = [
@@ -128,6 +131,12 @@ export function RadioVisionConsole() {
    * banner takes over. The next successful poll flips it back.
    */
   const [apiReachable, setApiReachable] = useState<boolean>(true);
+  // Auto-start gate. Once the operator has pressed Stop (or auto-start has
+  // already fired on this page load), don't keep re-starting in a loop. Also
+  // suppresses auto-start if the backend keeps reporting a serial error so
+  // we don't hammer /sessions every poll.
+  const autoStartedRef = useRef(false);
+  const userStoppedRef = useRef(false);
   /*
    * wallClockMs ticks every 1 s purely so the "is the board streaming right
    * now?" derivations re-evaluate. Without this, latest_window_age_seconds
@@ -147,6 +156,14 @@ export function RadioVisionConsole() {
   const serialPort = useMemo(() => {
     const rx = (devices?.rx ?? null) as Record<string, unknown> | null;
     const value = rx?.serial_port;
+    return typeof value === "string" && value.length > 0 ? value : null;
+  }, [devices]);
+  // Backend-reported source error (e.g. "could not open port 'COM10'"). The
+  // serial reader retries internally, so this is informational, not fatal —
+  // but the user needs to see it or they'll think Start did nothing.
+  const sourceError = useMemo(() => {
+    const rx = (devices?.rx ?? null) as Record<string, unknown> | null;
+    const value = rx?.last_error;
     return typeof value === "string" && value.length > 0 ? value : null;
   }, [devices]);
 
@@ -295,6 +312,39 @@ export function RadioVisionConsole() {
   }, [windows]);
   const boardStreaming = latestWindowAgeSec != null && latestWindowAgeSec < 3;
 
+  /*
+   * Auto-start: as soon as the API is reachable, the WS is connected, the
+   * source is configured (serial port for LIVE, or REPLAY mode), and there
+   * is no active session, we kick off a session for the operator. This is
+   * what they expect — the audit feedback was "I plugged everything in,
+   * why do I need to press a button?".
+   *
+   * Guards:
+   *   - autoStartedRef: only ever fires once per page load, even if the
+   *     gates flap (e.g. WS reconnects).
+   *   - userStoppedRef: if the operator hit Stop, we DO NOT auto-restart.
+   *     They can re-start manually with the Start button.
+   *   - sourceError: if the backend just told us the serial open failed,
+   *     don't loop POSTing /sessions/start every render. The retry logic
+   *     in read_serial_frames will re-open on its own.
+   */
+  useEffect(() => {
+    if (autoStartedRef.current) return;
+    if (userStoppedRef.current) return;
+    if (!apiReachable) return;
+    if (connectionStatus !== "connected") return;
+    if (hasSession) return;
+    if (startingSession) return;
+    if (sourceError) return; // wait for the operator to fix the port
+    const sourceReady = sourceMode === "REPLAY" || Boolean(serialPort);
+    if (!sourceReady) return;
+    autoStartedRef.current = true;
+    void quickStartSession();
+    // quickStartSession is stable for this scope; effect only depends on the
+    // gate values.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiReachable, connectionStatus, hasSession, startingSession, sourceMode, serialPort, sourceError]);
+
   const disconnected = !boardStreaming;
   /*
    * Reason priority (highest first). Each rung answers a different "why
@@ -338,6 +388,7 @@ export function RadioVisionConsole() {
               serialPort={serialPort}
               sourceMode={sourceMode}
               startError={error}
+              sourceError={sourceError}
               starting={startingSession}
               boardStreaming={boardStreaming}
               framesEverReceived={framesEverReceived}
@@ -347,6 +398,7 @@ export function RadioVisionConsole() {
               apiReachable={apiReachable}
               onRefresh={() => void refreshMetadata()}
               onStartSession={() => void quickStartSession()}
+              onStopSession={() => void stopActiveSession()}
               calibration={calibration}
               calibrationBusy={calibrationBusy}
               onCalibrate={(seconds) => void runCalibration(seconds)}
@@ -387,6 +439,10 @@ export function RadioVisionConsole() {
 
   async function stopActiveSession() {
     if (!activeSessionId) return;
+    // Mark explicit stop so the auto-start effect doesn't immediately
+    // re-create a session on the next render. Until the operator presses
+    // Start manually, the Live Room stays idle.
+    userStoppedRef.current = true;
     try {
       await stopSession(activeSessionId);
       setActiveSessionId(null);
@@ -398,6 +454,10 @@ export function RadioVisionConsole() {
 
   async function quickStartSession() {
     if (startingSession) return;
+    // Manual click clears the user-stopped flag so the auto-start gate
+    // can fire again on the next reconnect (e.g. after the operator
+    // toggled the port off/on).
+    userStoppedRef.current = false;
     setStartingSession(true);
     try {
       const session = await createSession({ protocol: "human_presence_static", notes: "quick-start" });
@@ -492,6 +552,7 @@ function LiveRoom({
   serialPort,
   sourceMode,
   startError,
+  sourceError,
   starting,
   boardStreaming,
   framesEverReceived,
@@ -501,6 +562,7 @@ function LiveRoom({
   apiReachable,
   onRefresh,
   onStartSession,
+  onStopSession,
   calibration,
   calibrationBusy,
   onCalibrate,
@@ -516,6 +578,7 @@ function LiveRoom({
   serialPort: string | null;
   sourceMode: SourceMode | null;
   startError: string | null;
+  sourceError: string | null;
   starting: boolean;
   boardStreaming: boolean;
   framesEverReceived: boolean;
@@ -525,6 +588,7 @@ function LiveRoom({
   apiReachable: boolean;
   onRefresh: () => void;
   onStartSession: () => void;
+  onStopSession: () => void;
   calibration: CalibrationStatus | null;
   calibrationBusy: boolean;
   onCalibrate: (seconds: number) => void;
@@ -532,20 +596,22 @@ function LiveRoom({
   onCalibrationCancel: () => void;
 }) {
   const vital = deriveVitalSummary(latest);
+  // Gate the heavy visualisation grid (5 charts + 8 cards) behind "we have
+  // ever seen a window". Otherwise the page is 15 empty cards on first load,
+  // which is what the operator was complaining about.
+  const showDataGrid = framesEverReceived;
+  // The previous layout rendered every card at once in a 3-column wall. With
+  // 13+ cards plus 5 charts, the page was visually overwhelming and the
+  // browser had to re-render every chart on each window arrival. The tabbed
+  // layout below keeps each tab to ~3-4 cards so only that tab's charts
+  // re-render — meaningfully less work per WS message.
+  const calibrated = Boolean(calibration?.is_calibrated || latest?.baseline_calibrated);
+  const incident = useMemo(() => deriveIncidentState(windows), [windows]);
+  const [roomTab, setRoomTab] = useState<RoomTabId>("overview");
+  const tabDefs = ROOM_TABS;
   return (
     <div className="pageStack">
-      <SensingOverview
-        latest={latest}
-        summary={summary}
-        connectionStatus={connectionStatus}
-        serialPort={serialPort}
-        sourceMode={sourceMode}
-        boardStreaming={boardStreaming}
-        latestWindowAgeSec={latestWindowAgeSec}
-        recentFramePerSec={recentFramePerSec}
-        onRefresh={onRefresh}
-      />
-      <ReadinessChecklist
+      <LiveControlBar
         apiReachable={apiReachable}
         connectionStatus={connectionStatus}
         sourceMode={sourceMode}
@@ -553,9 +619,34 @@ function LiveRoom({
         hasSession={hasSession}
         boardStreaming={boardStreaming}
         framesEverReceived={framesEverReceived}
-        calibrated={Boolean(calibration?.is_calibrated || latest?.baseline_calibrated)}
+        latestWindowAgeSec={latestWindowAgeSec}
+        recentFramePerSec={recentFramePerSec}
+        starting={starting}
+        // sourceError beats startError: a stale POST error matters less than
+        // a still-failing serial open.
+        startError={sourceError ?? startError}
+        onStart={onStartSession}
+        onStop={onStopSession}
+        onRefresh={onRefresh}
       />
-      {disconnected ? (
+      {!showDataGrid ? (
+        <ReadinessChecklist
+          apiReachable={apiReachable}
+          connectionStatus={connectionStatus}
+          sourceMode={sourceMode}
+          serialPort={serialPort}
+          hasSession={hasSession}
+          boardStreaming={boardStreaming}
+          framesEverReceived={framesEverReceived}
+          calibrated={calibrated}
+        />
+      ) : null}
+      {disconnected && disconnectedReason !== "no_session" ? (
+        // The "no_session" reason is fully covered by the LiveControlBar
+        // Start button; showing the same prompt twice is exactly the kind
+        // of clutter the operator flagged. Other reasons (api_offline,
+        // no_serial_port, no_frames_yet, etc.) still get the banner because
+        // they need their own copy.
         <DisconnectedBanner
           status={connectionStatus}
           reason={disconnectedReason}
@@ -566,160 +657,736 @@ function LiveRoom({
           onStartSession={onStartSession}
         />
       ) : null}
-      <section className="liveRoomGrid">
-        <div className="columnStack sideColumn">
-          <DeviceStatusCard
-            latest={latest}
-            serialPort={serialPort}
-            boardStreaming={boardStreaming}
-            framesEverReceived={framesEverReceived}
-            latestWindowAgeSec={latestWindowAgeSec}
-            recentFramePerSec={recentFramePerSec}
-          />
-          <SessionCard latest={latest} />
-          <SignalQualityCard latest={latest} />
-          <CalibrationCard
-            latest={latest}
-            calibration={calibration}
-            busy={calibrationBusy}
-            onCalibrate={onCalibrate}
-            onReset={onCalibrationReset}
-            onCancel={onCalibrationCancel}
-          />
-        </div>
-        <div className="columnStack centerColumn">
-          <Card title="Live Trends" sourceMode={latest?.source_mode ?? null}>
-            <TrendChart
-              windows={windows}
-              ariaLabel="Motion, occupancy, anomaly, and quality trend"
-              series={trendSeries}
-              height={260}
-            />
-          </Card>
-          <Card title="Biorhythm Spectrum" sourceMode={latest?.source_mode ?? null} researchOnly>
-            <TrendChart
-              windows={windows}
-              ariaLabel="Respiration and heart-rate proxy trend"
-              series={biorhythmSeries}
-              height={200}
-            />
-            <BiorhythmStatus latest={latest} />
-          </Card>
-          <Card title="Subcarrier Amplitude" sourceMode={latest?.source_mode ?? null}>
-            <AmplitudeChart windows={windows} />
-          </Card>
-          <Card title="Subcarrier Responsiveness" sourceMode={latest?.source_mode ?? null}>
-            <SubcarrierBars windows={windows} metric="amplitude_std" />
-            <small style={{ color: "var(--text-muted)" }}>
-              Mean amplitude std per subcarrier across the last 30 windows. Tall bars = subcarriers most disturbed by
-              the body in the link.
-            </small>
-          </Card>
-          <Card title="Subcarrier-time map" sourceMode={latest?.source_mode ?? null}>
-            <SubcarrierTimeMap windows={windows} height={220} />
-            <small style={{ color: "var(--text-muted)" }}>
-              Rows = subcarriers, columns = windows over time, intensity = amplitude std. Real respiration shows up
-              as a few adjacent rows pulsing in lockstep; broadband motion paints the whole map.
-            </small>
-          </Card>
-        </div>
-        <div className="columnStack sideColumn">
-          <RespirationCard latest={latest} windows={windows} vital={vital} />
-          <HeartBandCard latest={latest} windows={windows} vital={vital} />
-          <FidgetEnergyCard latest={latest} windows={windows} />
-          <MetricCard
-            title="Occupancy score"
-            value={latest ? latest.occupancy_score.toFixed(2) : null}
-            detail={
-              latest?.baseline_calibrated
-                ? "Anomaly-vs-baseline score. Backend-derived."
-                : "Uncalibrated - run baseline before reading this."
+      {!showDataGrid ? (
+        <section className="liveRoomEmpty">
+          <EmptyState
+            title={
+              hasSession
+                ? "Session running — waiting for first derived window"
+                : "Press Start above to begin streaming"
             }
-            confidence={confidenceFrom(latest?.quality_score)}
-            sparkline={windows.map((window) => window.occupancy_score)}
+            message={
+              hasSession
+                ? "The DSP needs ~10 buffered raw frames before it emits a window. Watch the API logs for [runtime] collector heartbeat to confirm CSI is arriving."
+                : sourceMode === "REPLAY"
+                ? "Start opens the replay file and feeds frames at the configured rate."
+                : `Start opens the serial port (${serialPort ?? "AETHER_SERIAL_PORT unset"}) and reads CSI from the RX board.`
+            }
           />
-          <MetricCard
-            title="Motion score"
-            value={latest ? latest.motion_score.toFixed(2) : null}
-            detail="Bandpass-filtered, baseline-subtracted RMS across subcarriers."
-            confidence={confidenceFrom(latest?.quality_score)}
-            sparkline={windows.map((window) => window.motion_score)}
-          />
-          <RoomSummaryCard summary={summary} />
-          <Card title="Event Ticker">
-            <EmptyState title="No events available" message="Events will appear after labels are written during an active session." />
-          </Card>
-        </div>
-      </section>
+        </section>
+      ) : null}
+      {showDataGrid ? (
+        <>
+          <nav className="roomTabs" role="tablist" aria-label="Live room views">
+            {tabDefs.map((tab) => {
+              const active = tab.id === roomTab;
+              const badge =
+                tab.id === "diagnostics" && !calibrated
+                  ? "needs cal"
+                  : tab.id === "movement" && incident.state === "suspected"
+                  ? "alert"
+                  : null;
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  className={`roomTab${active ? " roomTab--active" : ""}`}
+                  onClick={() => setRoomTab(tab.id)}
+                >
+                  <span className="roomTabLabel">{tab.label}</span>
+                  <span className="roomTabHint">{tab.hint}</span>
+                  {badge ? <span className={`roomTabBadge roomTabBadge--${badge === "alert" ? "danger" : "warn"}`}>{badge}</span> : null}
+                </button>
+              );
+            })}
+          </nav>
+          {roomTab === "overview" ? (
+            <section className="roomPanel roomPanel--two">
+              <div className="columnStack">
+                <DeviceStatusCard
+                  latest={latest}
+                  serialPort={serialPort}
+                  boardStreaming={boardStreaming}
+                  framesEverReceived={framesEverReceived}
+                  latestWindowAgeSec={latestWindowAgeSec}
+                  recentFramePerSec={recentFramePerSec}
+                />
+                <SessionCard latest={latest} />
+                <SignalQualityCard latest={latest} />
+                <RoomSummaryCard summary={summary} />
+              </div>
+              <div className="columnStack">
+                <Card title="Live Trends" sourceMode={latest?.source_mode ?? null}>
+                  <TrendChart
+                    windows={windows}
+                    ariaLabel="Motion, occupancy, anomaly, and quality trend"
+                    series={trendSeries}
+                    height={280}
+                  />
+                </Card>
+                <IncidentCard incident={incident} latest={latest} />
+              </div>
+            </section>
+          ) : null}
+          {roomTab === "vitals" ? (
+            <section className="roomPanel roomPanel--two">
+              <div className="columnStack">
+                <RespirationCard latest={latest} windows={windows} vital={vital} />
+                <HeartBandCard latest={latest} windows={windows} vital={vital} />
+                <GaitCard latest={latest} windows={windows} />
+                <FidgetEnergyCard latest={latest} windows={windows} />
+              </div>
+              <div className="columnStack">
+                <Card title="Biorhythm Spectrum" sourceMode={latest?.source_mode ?? null} researchOnly>
+                  <TrendChart
+                    windows={windows}
+                    ariaLabel="Respiration and heart-rate proxy trend"
+                    series={biorhythmSeries}
+                    height={240}
+                  />
+                  <BiorhythmStatus latest={latest} />
+                </Card>
+                <p className="researchNote">
+                  These are <strong>motion-band periodicities</strong>, not vital signs. The 0.8–2.5 Hz peak is the
+                  strongest periodic motion in that band — on PCB antennas at 2 m it is most often a respiration
+                  harmonic, walking cadence, or hardware drift, not cardiac micro-motion. Treat every reading as
+                  <code>[Inference]</code>; we display a number only when stillness, FFT/ACF agreement, and harmonic
+                  checks all pass.
+                </p>
+              </div>
+            </section>
+          ) : null}
+          {roomTab === "movement" ? (
+            <section className="roomPanel roomPanel--two">
+              <div className="columnStack">
+                <IncidentCard incident={incident} latest={latest} />
+                <GaitCard latest={latest} windows={windows} />
+                <MetricCard
+                  title="Motion score"
+                  value={latest ? latest.motion_score.toFixed(2) : null}
+                  detail="Backend-derived motion energy. Spikes on near-link motion."
+                  confidence={confidenceFrom(latest?.quality_score)}
+                  sparkline={windows.map((window) => window.motion_score)}
+                />
+                <MetricCard
+                  title="Occupancy score"
+                  value={latest ? latest.occupancy_score.toFixed(2) : null}
+                  detail={
+                    latest?.baseline_calibrated
+                      ? "Anomaly-vs-baseline score. Backend-derived."
+                      : "Uncalibrated — run baseline before reading this."
+                  }
+                  confidence={confidenceFrom(latest?.quality_score)}
+                  sparkline={windows.map((window) => window.occupancy_score)}
+                />
+              </div>
+              <div className="columnStack">
+                <Card title="Motion / occupancy / anomaly" sourceMode={latest?.source_mode ?? null}>
+                  <TrendChart
+                    windows={windows}
+                    ariaLabel="Motion, occupancy, and anomaly trend"
+                    series={trendSeries.filter((series) => series.label !== "Quality")}
+                    height={280}
+                  />
+                </Card>
+              </div>
+            </section>
+          ) : null}
+          {roomTab === "subcarriers" ? (
+            <section className="roomPanel roomPanel--single">
+              <Card title="Subcarrier Amplitude" sourceMode={latest?.source_mode ?? null}>
+                <AmplitudeChart windows={windows} />
+              </Card>
+              <Card title="Subcarrier Responsiveness" sourceMode={latest?.source_mode ?? null}>
+                <SubcarrierBars windows={windows} metric="amplitude_std" />
+                <small style={{ color: "var(--text-muted)" }}>
+                  Mean amplitude std per subcarrier across the last 30 windows. Tall bars = subcarriers most disturbed by
+                  the body in the link.
+                </small>
+              </Card>
+              <Card title="Subcarrier-time map" sourceMode={latest?.source_mode ?? null}>
+                <SubcarrierTimeMap windows={windows} height={220} />
+                <small style={{ color: "var(--text-muted)" }}>
+                  Rows = subcarriers, columns = windows over time, intensity = amplitude std. Real respiration shows up
+                  as a few adjacent rows pulsing in lockstep; broadband motion paints the whole map.
+                </small>
+              </Card>
+            </section>
+          ) : null}
+          {roomTab === "diagnostics" ? (
+            <section className="roomPanel roomPanel--two">
+              <div className="columnStack">
+                <CalibrationCard
+                  latest={latest}
+                  calibration={calibration}
+                  busy={calibrationBusy}
+                  onCalibrate={onCalibrate}
+                  onReset={onCalibrationReset}
+                  onCancel={onCalibrationCancel}
+                />
+                <DemoPresetCard />
+                <LatencyBudgetCard latest={latest} windows={windows} />
+                <RoomSummaryCard summary={summary} />
+              </div>
+              <div className="columnStack">
+                <Card title="Quality trend" sourceMode={latest?.source_mode ?? null}>
+                  <TrendChart
+                    windows={windows}
+                    ariaLabel="Signal quality and motion trend"
+                    series={trendSeries.filter((s) => s.label === "Quality" || s.label === "Motion")}
+                    height={220}
+                  />
+                </Card>
+                <Card title="Deeper inspection">
+                  <p style={{ color: "var(--text-muted)", fontSize: 13, lineHeight: 1.5 }}>
+                    For per-frame I/Q, link inter-arrival p99/jitter, and live subcarrier amplitude/phase, open the
+                    Raw inspector in the top-right.
+                  </p>
+                  <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+                    <a href="/raw" className="iconButton" style={{ textDecoration: "none" }}>Open Raw Inspector</a>
+                    <a href="/3d" className="iconButton" style={{ textDecoration: "none" }}>Open 3D Geometry</a>
+                  </div>
+                </Card>
+              </div>
+            </section>
+          ) : null}
+        </>
+      ) : null}
     </div>
   );
 }
 
-function SensingOverview({
-  latest,
-  summary,
-  connectionStatus,
-  serialPort,
-  sourceMode,
-  boardStreaming,
-  latestWindowAgeSec,
-  recentFramePerSec,
-  onRefresh
-}: {
-  latest: DerivedWindow | null;
-  summary: RoomSummary | null;
-  connectionStatus: string;
-  serialPort: string | null;
-  sourceMode: SourceMode | null;
-  boardStreaming: boolean;
-  latestWindowAgeSec: number | null;
-  recentFramePerSec: number | null;
-  onRefresh: () => void;
-}) {
-  // The headline word for the operator: "streaming" beats "connected" because
-  // the WS being open does NOT imply the RX board is actually emitting CSI.
-  const liveLabel = boardStreaming
-    ? "streaming"
-    : latestWindowAgeSec != null
-    ? `stalled (${latestWindowAgeSec.toFixed(0)} s)`
-    : connectionStatus === "connected"
-    ? "no frames"
-    : connectionStatus;
-  const rateLabel = recentFramePerSec != null ? `${recentFramePerSec.toFixed(1)} Hz` : "--";
+/* ---------- Tab definitions ---------- */
+
+type RoomTabId = "overview" | "vitals" | "movement" | "subcarriers" | "diagnostics";
+const ROOM_TABS: { id: RoomTabId; label: string; hint: string }[] = [
+  { id: "overview", label: "Overview", hint: "device · session · trends" },
+  { id: "vitals", label: "Periodic Motion", hint: "respiration · motion peaks · fidget" },
+  { id: "movement", label: "Movement", hint: "motion · occupancy · incidents" },
+  { id: "subcarriers", label: "Subcarriers", hint: "amplitude · responsiveness" },
+  { id: "diagnostics", label: "Diagnostics", hint: "calibration · link · raw" },
+];
+
+/* ---------- Incident inference ---------- */
+
+type IncidentState = "idle" | "spike" | "post-spike-still" | "suspected";
+type IncidentReading = {
+  state: IncidentState;
+  detail: string;
+  spikeMotion: number | null;
+  recentMotion: number | null;
+  stillSeconds: number;
+  windowsUsed: number;
+};
+
+/*
+ * Hysteretic fall/incident inference. NOT medical-grade. CSI motion is a
+ * pure derived signal — we cannot tell a person from a pet from a falling
+ * object. The classifier is a small state machine:
+ *
+ *   idle         -> spike when motion crosses the SPIKE threshold
+ *   spike        -> post-spike-still once motion drops below STILL
+ *   post-still   -> suspected after STILL persists for SUSTAINED_S
+ *   suspected    -> stays suspected until motion crosses SPIKE again
+ *                   (then back to spike) or RESET_S elapses with motion
+ *                   confirmed normal (then back to idle)
+ *
+ * The big change vs. the previous threshold-only version:
+ *  - State persists across windows; "suspected" requires SUSTAINED stillness,
+ *    not a single quiet half-window. False positives drop sharply.
+ *  - Calibrated baselines tighten the STILL threshold so a pet's background
+ *    motion doesn't keep us perpetually in "spike."
+ *
+ * UI labels this as [Inference] with a permanent disclaimer. Per CLAUDE.md
+ * we DO NOT claim medical or safety guarantees.
+ */
+const INCIDENT_SPIKE = 6.0;             // motion above this is a clear event
+const INCIDENT_STILL_UNCAL = 1.4;       // uncalibrated stillness threshold
+const INCIDENT_STILL_CAL = 0.8;         // tighter once baseline is captured
+const INCIDENT_SUSTAINED_S = 4.0;       // stillness must last this long after a spike
+const INCIDENT_RESET_S = 8.0;           // suspected -> idle after this much normal motion
+
+function deriveIncidentState(windows: DerivedWindow[]): IncidentReading {
+  if (windows.length < 6) {
+    return {
+      state: "idle",
+      detail: "Buffering — need a few seconds of motion data.",
+      spikeMotion: null,
+      recentMotion: null,
+      stillSeconds: 0,
+      windowsUsed: windows.length,
+    };
+  }
+
+  // Use the last ~80 windows (≥10 s at 8 Hz, ≥4 s at 20 Hz).
+  const tail = windows.slice(-Math.min(windows.length, 80));
+  const calibrated = tail[tail.length - 1]?.baseline_calibrated ?? false;
+  const stillThreshold = calibrated ? INCIDENT_STILL_CAL : INCIDENT_STILL_UNCAL;
+
+  // Walk the buffer forward, advancing a small state machine. We don't
+  // mutate React state — we just replay enough windows to stabilize on a
+  // current state. The buffer length is bounded so this is O(N) per call.
+  let state: IncidentState = "idle";
+  let spikeMotion = 0;
+  let stillSinceNs: number | null = null;
+  let lastNs = tail[0].window_end_ns;
+  for (const w of tail) {
+    const motion = w.motion_score;
+    const tNs = w.window_end_ns;
+    const dt = Math.max(0, (tNs - lastNs) / 1e9);
+    lastNs = tNs;
+
+    if (motion >= INCIDENT_SPIKE) {
+      // Any large motion resets to spike (and clears the still timer).
+      state = "spike";
+      spikeMotion = Math.max(spikeMotion, motion);
+      stillSinceNs = null;
+      continue;
+    }
+
+    if (state === "spike") {
+      if (motion < stillThreshold) {
+        // Just entered post-spike stillness.
+        state = "post-spike-still";
+        stillSinceNs = tNs;
+      }
+    } else if (state === "post-spike-still") {
+      if (motion < stillThreshold) {
+        const stillS = stillSinceNs == null ? 0 : (tNs - stillSinceNs) / 1e9;
+        if (stillS >= INCIDENT_SUSTAINED_S) {
+          state = "suspected";
+        }
+      } else {
+        // Motion came back — drop back to plain "spike" tracking the new
+        // value. If it stays low we'll re-enter post-spike-still.
+        state = motion >= INCIDENT_SPIKE / 2 ? "spike" : "idle";
+        stillSinceNs = null;
+      }
+    } else if (state === "suspected") {
+      // Stay suspected until we either see another spike (→ spike) or the
+      // motion has been "normal but not still" continuously for RESET_S.
+      if (motion < stillThreshold) {
+        // continued stillness — stay suspected, don't reset
+      } else if (motion >= INCIDENT_SPIKE) {
+        state = "spike";
+        spikeMotion = motion;
+        stillSinceNs = null;
+      } else {
+        // normal motion — start a "back to active" timer reusing stillSinceNs
+        // as the "since-last-non-still" timestamp.
+        if (stillSinceNs == null) stillSinceNs = tNs;
+        const activeS = (tNs - stillSinceNs) / 1e9;
+        if (activeS >= INCIDENT_RESET_S) {
+          state = "idle";
+          spikeMotion = 0;
+          stillSinceNs = null;
+        }
+      }
+    } else {
+      // idle: track motion entering still vs active
+      if (motion < stillThreshold) {
+        // ambient stillness — nothing to do
+      }
+      // ignore dt to keep state simple
+      void dt;
+    }
+  }
+
+  const recentTail = tail.slice(-Math.max(1, Math.min(tail.length, 8)));
+  const recentMotion =
+    recentTail.reduce((acc, w) => acc + w.motion_score, 0) / recentTail.length;
+  const stillSeconds =
+    stillSinceNs == null
+      ? 0
+      : Math.max(0, (tail[tail.length - 1].window_end_ns - stillSinceNs) / 1e9);
+
+  let detail: string;
+  if (state === "suspected") {
+    detail = `Sustained stillness (${stillSeconds.toFixed(1)} s) after a motion spike. Could be a fall — or someone simply sat down. Investigate.`;
+  } else if (state === "post-spike-still") {
+    detail = `Motion peaked and is settling. ${stillSeconds.toFixed(1)} s of stillness so far — needs ${INCIDENT_SUSTAINED_S.toFixed(1)} s before flagging.`;
+  } else if (state === "spike") {
+    detail = "Active motion in the link.";
+  } else {
+    detail =
+      recentMotion < stillThreshold
+        ? "Quiet — no significant motion in the link."
+        : "Low-level motion — normal background.";
+  }
+
+  return {
+    state,
+    detail,
+    spikeMotion: spikeMotion || null,
+    recentMotion,
+    stillSeconds,
+    windowsUsed: tail.length,
+  };
+}
+
+/* ---------- Latency budget (item 9.4) ---------- */
+
+/*
+ * End-to-end latency observability. We report what we can measure
+ * truthfully from the host clock alone — TX/RX device clocks aren't
+ * synced to the host so any "end-to-end" number that pretends to start
+ * at TX is fiction. What we can show:
+ *
+ *  - Host → UI: now() minus the last window's window_end_ns (last raw
+ *    frame in the latest derived window). This is the visible-data age.
+ *  - Inter-window gap: the gap between consecutive windows' end times,
+ *    averaged over the last 30 windows.
+ *  - DSP cadence: derived windows per second (frontend-observed).
+ *
+ * The card refuses to display garbage if we don't have enough data.
+ */
+/* ---------- Demo presets (item 9.2) ---------- */
+
+function DemoPresetCard() {
+  const [presets, setPresets] = useState<DemoPreset[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const data = await listPresets();
+        if (!cancelled) setPresets(data.presets);
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : "load failed");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function play(preset: DemoPreset) {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await startPreset(preset.id);
+      // The shell's polling effect will pick up the new session within ~5 s.
+      // Until then the user sees the existing UI; no state to reset here.
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "preset start failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
-    <section className="overviewBand">
-      <div>
-        <span className="eyebrow">Contactless CSI Sensing</span>
-        <h2>Realtime CSI motion &amp; occupancy with research-only physiology proxies</h2>
-        <p>
-          Two CSI-capable ESP32-S3 nodes bracket the seated subject. The UI streams derived RF windows from the API
-          over <code>/ws/live</code> and surfaces motion, occupancy, RSSI, packet rate, and a CSI waterfall. Heart-rate,
-          HRV, fidget and stress cards are CSI motion proxies, not validated physiology.
-        </p>
-        {/*
-         * suppressHydrationWarning on each dynamic <span>: the visible text
-         * is derived from live state (connectionStatus, summary, frame age)
-         * and the client overwrites it within a tick of hydration anyway.
-         * Suppressing here prevents a future state-init change from blowing
-         * up React the way it did when wallClockMs used Date.now().
-         */}
-        <div className="runtimeNoticeRow">
-          <span suppressHydrationWarning>Mode <code>{sourceMode ?? "unknown"}</code></span>
-          <span suppressHydrationWarning>Serial <code>{serialPort ?? "unset"}</code></span>
-          <span suppressHydrationWarning>WS <code>{connectionStatus}</code></span>
-          <span suppressHydrationWarning>Stream <code>{liveLabel}</code></span>
+    <Card title="Demo replays">
+      {error ? <div className="incidentWarn">{error}</div> : null}
+      {presets.length === 0 ? (
+        <small style={{ color: "var(--text-muted)" }}>
+          No recordings yet. Each completed session writes a JSONL to{" "}
+          <code>data/recordings/</code>; pick the file from that list and replay
+          it deterministically for the demo.
+        </small>
+      ) : (
+        <>
+          <small style={{ color: "var(--text-muted)" }}>
+            Click to stop the live source and replay a recorded session at 20 Hz.
+            Useful when the hardware is finicky or the room conditions changed
+            since the demo was rehearsed.
+          </small>
+          <div className="labelGrid" style={{ marginTop: 8, flexDirection: "column", gap: 6 }}>
+            {presets.slice(0, 8).map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                className="secondaryButton"
+                style={{ textAlign: "left", justifyContent: "flex-start" }}
+                onClick={() => void play(preset)}
+                disabled={busy}
+                title={`${preset.estimated_frames.toLocaleString()} frames, ${(
+                  preset.size_bytes / 1024 / 1024
+                ).toFixed(1)} MB`}
+              >
+                ▶ {preset.label}
+                <span style={{ marginLeft: 8, color: "var(--text-faint)", fontSize: 11 }}>
+                  ~{preset.estimated_frames.toLocaleString()} frames
+                </span>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </Card>
+  );
+}
+
+function LatencyBudgetCard({ latest, windows }: { latest: DerivedWindow | null; windows: DerivedWindow[] }) {
+  const now = Date.now();
+  const visibleAgeMs = latest ? now - latest.window_end_ns / 1_000_000 : null;
+  const tail = windows.slice(-30);
+  let gapP50: number | null = null;
+  let gapP95: number | null = null;
+  let dspHz: number | null = null;
+  if (tail.length >= 4) {
+    const gaps: number[] = [];
+    for (let i = 1; i < tail.length; i += 1) {
+      gaps.push((tail[i].window_end_ns - tail[i - 1].window_end_ns) / 1_000_000);
+    }
+    gaps.sort((a, b) => a - b);
+    gapP50 = gaps[Math.floor(gaps.length * 0.5)];
+    gapP95 = gaps[Math.floor(gaps.length * 0.95)] ?? gaps[gaps.length - 1];
+    const span = (tail[tail.length - 1].window_end_ns - tail[0].window_end_ns) / 1e9;
+    if (span > 0) dspHz = (tail.length - 1) / span;
+  }
+  const tone =
+    visibleAgeMs == null ? "muted"
+    : visibleAgeMs < 300 ? "good"
+    : visibleAgeMs < 1500 ? "warn"
+    : "danger";
+  return (
+    <div className="card incidentCard" data-tone={tone}>
+      <div className="incidentHead">
+        <span className="incidentBadge">latency</span>
+        <h3 className="incidentTitle">End-to-end budget</h3>
+      </div>
+      <div className={`incidentHeadline tone-${tone}`}>
+        {visibleAgeMs == null ? "—" : `${visibleAgeMs.toFixed(0)} ms`}
+        <span style={{ fontSize: 11, marginLeft: 8, color: "var(--text-faint)" }}>data age</span>
+      </div>
+      <div className="incidentMetrics">
+        <div>
+          <span>window p50 gap</span>
+          <strong>{gapP50 != null ? `${gapP50.toFixed(0)} ms` : "—"}</strong>
+        </div>
+        <div>
+          <span>window p95 gap</span>
+          <strong>{gapP95 != null ? `${gapP95.toFixed(0)} ms` : "—"}</strong>
+        </div>
+        <div>
+          <span>DSP rate</span>
+          <strong>{dspHz != null ? `${dspHz.toFixed(1)} Hz` : "—"}</strong>
         </div>
       </div>
-      <div className="overviewStats">
-        <div><span>Stream</span><strong suppressHydrationWarning>{liveLabel}</strong></div>
-        <div><span>Rate</span><strong suppressHydrationWarning>{rateLabel}</strong></div>
-        <div><span>Frames</span><strong suppressHydrationWarning>{latest?.packet_count ?? "--"}</strong></div>
-        <div><span>Room</span><strong suppressHydrationWarning>{summary?.status ?? summary?.occupancy ?? "waiting"}</strong></div>
-        <button className="iconButton" onClick={onRefresh} aria-label="Refresh runtime state" type="button">
-          <RefreshCw size={16} />
-        </button>
+      <p className="incidentDisclaimer">
+        Data age = wall-clock time since the last raw frame in the latest derived window. Inter-window gap
+        captures DSP cadence variance. We can&apos;t report TX→RX device latency without clock sync — see
+        link diagnostics for inter-arrival jitter.
+      </p>
+    </div>
+  );
+}
+
+function IncidentCard({ incident, latest }: { incident: IncidentReading; latest: DerivedWindow | null }) {
+  const tone =
+    incident.state === "suspected" ? "danger"
+    : incident.state === "post-spike-still" ? "warn"
+    : incident.state === "spike" ? "info"
+    : "muted";
+  const headline =
+    incident.state === "suspected" ? "INCIDENT SUSPECTED"
+    : incident.state === "post-spike-still" ? "Settling after spike"
+    : incident.state === "spike" ? "Active motion"
+    : "All quiet";
+  const calibrated = Boolean(latest?.baseline_calibrated);
+  return (
+    <div className="card incidentCard" data-tone={tone}>
+      <div className="incidentHead">
+        <span className="incidentBadge">[Inference]</span>
+        <h3 className="incidentTitle">Fall / incident watch</h3>
       </div>
+      <div className={`incidentHeadline tone-${tone}`}>{headline}</div>
+      <p className="incidentDetail">{incident.detail}</p>
+      <div className="incidentMetrics">
+        <div>
+          <span>spike motion</span>
+          <strong>{incident.spikeMotion != null ? incident.spikeMotion.toFixed(1) : "—"}</strong>
+        </div>
+        <div>
+          <span>recent motion</span>
+          <strong>{incident.recentMotion != null ? incident.recentMotion.toFixed(1) : "—"}</strong>
+        </div>
+        <div>
+          <span>still for</span>
+          <strong>{incident.stillSeconds > 0 ? `${incident.stillSeconds.toFixed(1)}s` : "—"}</strong>
+        </div>
+      </div>
+      {!calibrated ? (
+        <p className="incidentWarn">Baseline not calibrated — thresholds use uncalibrated motion energy and will fire spuriously near walls or hardware drift. Capture baseline on the Diagnostics tab.</p>
+      ) : null}
+      <p className="incidentDisclaimer">
+        Heuristic only. CSI motion can be a pet, an object, hardware drift, or a person — we cannot tell which. Do not use for safety decisions.
+      </p>
+    </div>
+  );
+}
+
+/*
+ * LiveControlBar — the single sticky strip at the top of the Live Room.
+ *
+ * The audit complaint was "I can't tell when it's connected or something is
+ * happening, and I can't find how to start streaming". This bar answers both
+ * in one row:
+ *
+ *   - 4 status pills (API / WS / Source / Stream) each green when healthy
+ *     and red/grey/amber otherwise. Stream shows live Hz when frames flow.
+ *   - one big primary action: Start (when no session) or Stop (when running).
+ *   - any startError surfaces below the pills so a failed serial open is
+ *     not silently swallowed.
+ */
+function LiveControlBar({
+  apiReachable,
+  connectionStatus,
+  sourceMode,
+  serialPort,
+  hasSession,
+  boardStreaming,
+  framesEverReceived,
+  latestWindowAgeSec,
+  recentFramePerSec,
+  starting,
+  startError,
+  onStart,
+  onStop,
+  onRefresh
+}: {
+  apiReachable: boolean;
+  connectionStatus: string;
+  sourceMode: SourceMode | null;
+  serialPort: string | null;
+  hasSession: boolean;
+  boardStreaming: boolean;
+  framesEverReceived: boolean;
+  latestWindowAgeSec: number | null;
+  recentFramePerSec: number | null;
+  starting: boolean;
+  startError: string | null;
+  onStart: () => void;
+  onStop: () => void;
+  onRefresh: () => void;
+}) {
+  type Tone = "good" | "warn" | "danger" | "muted" | "info";
+  const apiTone: Tone = apiReachable ? "good" : "danger";
+  const apiLabel = apiReachable ? "ONLINE" : "OFFLINE";
+  const wsTone: Tone =
+    connectionStatus === "connected" ? "good"
+    : connectionStatus === "connecting" ? "info"
+    : "danger";
+  const wsLabel = connectionStatus.toUpperCase();
+  const sourceConfigured = sourceMode === "REPLAY" || Boolean(serialPort);
+  const sourceTone: Tone = sourceConfigured ? "good" : "warn";
+  const sourceLabel = sourceMode === "REPLAY"
+    ? "REPLAY"
+    : serialPort
+    ? serialPort.toUpperCase()
+    : "PORT UNSET";
+  const streamTone: Tone = boardStreaming
+    ? "good"
+    : framesEverReceived
+    ? "warn"
+    : hasSession
+    ? "info"
+    : "muted";
+  const streamLabel = boardStreaming && recentFramePerSec != null
+    ? `${recentFramePerSec.toFixed(1)} Hz`
+    : framesEverReceived && latestWindowAgeSec != null
+    ? `STALLED ${latestWindowAgeSec.toFixed(0)}s`
+    : hasSession
+    ? "WAITING"
+    : "NOT STARTED";
+  const startDisabled = starting || !apiReachable || (sourceMode === "LIVE" && !serialPort);
+  return (
+    <section className="liveControlBar" aria-label="Stream control">
+      <div className="liveControlPills">
+        <Pill label="API" tone={apiTone} value={apiLabel} />
+        <Pill label="WS" tone={wsTone} value={wsLabel} />
+        <Pill label="SOURCE" tone={sourceTone} value={sourceLabel} />
+        <Pill label="STREAM" tone={streamTone} value={streamLabel} />
+      </div>
+      <div className="liveControlActions">
+        <button
+          type="button"
+          className="iconButton"
+          onClick={onRefresh}
+          aria-label="Refresh runtime state"
+        >
+          <RefreshCw size={14} />
+        </button>
+        {hasSession ? (
+          <button
+            type="button"
+            onClick={onStop}
+            style={{
+              minWidth: 180,
+              padding: "10px 22px",
+              fontSize: 14,
+              fontWeight: 700,
+              letterSpacing: "0.06em",
+              textTransform: "uppercase",
+              background: "transparent",
+              color: "#ff5e5e",
+              border: "1px solid #ff5e5e",
+              cursor: "pointer",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 8,
+              justifyContent: "center",
+            }}
+          >
+            <Square size={14} /> STOP STREAMING
+          </button>
+        ) : (
+          // Hard-coded inline styles so the button is visible even if a stale
+          // Turbopack chunk drops the .liveControlPrimary class — the audit
+          // feedback was "I do not see a Start button anywhere", so we
+          // refuse to depend on a CSS class that might not have shipped yet.
+          <button
+            type="button"
+            onClick={onStart}
+            disabled={startDisabled}
+            style={{
+              minWidth: 200,
+              padding: "10px 22px",
+              fontSize: 14,
+              fontWeight: 700,
+              letterSpacing: "0.06em",
+              textTransform: "uppercase",
+              background: startDisabled ? "#333" : "#1f7a3a",
+              color: startDisabled ? "#888" : "#ffffff",
+              border: `1px solid ${startDisabled ? "#444" : "#25923f"}`,
+              cursor: startDisabled ? "not-allowed" : "pointer",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 8,
+              justifyContent: "center",
+            }}
+            title={
+              !apiReachable
+                ? "API is offline — start uvicorn first"
+                : sourceMode === "LIVE" && !serialPort
+                ? "Set AETHER_SERIAL_PORT and restart the API"
+                : "Open the serial port and begin streaming"
+            }
+          >
+            {starting ? "STARTING…" : "▶ START STREAMING"}
+          </button>
+        )}
+      </div>
+      {startError ? (
+        <div className="liveControlError" role="alert">
+          {startError}
+        </div>
+      ) : null}
     </section>
+  );
+}
+
+function Pill({ label, value, tone }: { label: string; value: string; tone: "good" | "warn" | "danger" | "muted" | "info" }) {
+  return (
+    <div className={`statusPill tone-${tone}`}>
+      <span className="statusPillLabel">{label}</span>
+      <span className="statusPillValue">{value}</span>
+    </div>
   );
 }
 
@@ -1047,6 +1714,15 @@ function CalibrationCard({
           </>
         )}
       </div>
+      {calibration?.drift_detected ? (
+        <div className="incidentWarn" style={{ marginTop: 8 }}>
+          Drift detected — the still-frame amplitude has moved {(((calibration?.drift_score ?? 0) * 100)).toFixed(0)}% from the captured baseline ({calibration?.drift_samples ?? 0} still-frame samples). Recalibrate to restore reliable motion / occupancy thresholds.
+        </div>
+      ) : calibrated && (calibration?.drift_samples ?? 0) > 0 ? (
+        <small style={{ color: "var(--text-muted)" }}>
+          Drift score {(((calibration?.drift_score ?? 0) * 100)).toFixed(1)}% over {calibration?.drift_samples ?? 0} still-frame samples (warn at 18%).
+        </small>
+      ) : null}
       <small style={{ color: "var(--text-muted)" }}>
         Without a baseline, occupancy reads &quot;uncalibrated&quot; even if motion is detected.
       </small>
@@ -1203,13 +1879,13 @@ function HeartBandCard({
   const fft = latest?.heart_rate_proxy_bpm ?? null;
   const acf = latest?.heart_rate_proxy_bpm_acf ?? null;
   return (
-    <Card title="Periodic motion in HR band (research)" sourceMode={latest?.source_mode ?? null} researchOnly>
+    <Card title="Motion-band peak (0.8–2.5 Hz)" sourceMode={latest?.source_mode ?? null} researchOnly>
       {vital.stillnessGated ? (
-        <div className="gateBanner">Movement detected — HR-band reading suppressed.</div>
+        <div className="gateBanner">Movement detected — motion-band peak suppressed.</div>
       ) : null}
       {vital.looksLikeHarmonic ? (
         <div className="harmonicBanner">
-          Peak frequency is ~2× the respiration peak — likely a respiration harmonic, not heart rate.
+          Peak frequency is ~2× the respiration peak — almost certainly a respiration harmonic.
         </div>
       ) : null}
       <MetricCard
@@ -1229,6 +1905,46 @@ function HeartBandCard({
         2 m, real cardiac micro-motion is below the noise floor; what you see here is far more often respiration
         harmonics, fidgeting, or interference. We display a number only when stillness, FFT/ACF agreement, and
         harmonic checks all pass.
+      </small>
+    </Card>
+  );
+}
+
+/*
+ * Walking gait / cadence card. Shows the spectral peak frequency in
+ * the 1.5–3 Hz band (typical adult walking step rate) plus the band
+ * energy ratio. Sustained peaks here = walking through the link.
+ *
+ * Labelled [Inference] — CSI sees motion, not feet. A dog running back
+ * and forth or a fan spinning at 2 Hz would also light this up.
+ */
+function GaitCard({ latest, windows }: { latest: DerivedWindow | null; windows: DerivedWindow[] }) {
+  const stepsPerMin = latest?.gait_steps_per_min ?? null;
+  const score = latest?.gait_score ?? null;
+  const trend = windows
+    .map((w) => w.gait_steps_per_min ?? null)
+    .filter((v): v is number => v != null && Number.isFinite(v));
+  // Heuristic: only display a number if energy ratio is meaningful AND
+  // we have a peak. This avoids printing 100 spm when the whole spectrum
+  // is at the noise floor.
+  const stable = score != null && score > 0.06 && stepsPerMin != null;
+  return (
+    <Card title="Walking cadence (1.5–3 Hz)" sourceMode={latest?.source_mode ?? null} researchOnly>
+      <MetricCard
+        title=""
+        value={stable ? Math.round(stepsPerMin).toString() : null}
+        unit={stable ? "steps/min" : undefined}
+        confidence={confidenceFrom(score)}
+        detail={
+          stable
+            ? "Sustained peak in walking-cadence band. [Inference] — CSI sees motion, not feet."
+            : "No walking-cadence peak above the noise floor in this window."
+        }
+        sparkline={trend}
+      />
+      <small style={{ color: "var(--text-muted)" }}>
+        Band energy ratio: {score != null ? `${(score * 100).toFixed(0)}%` : "--"}. Walking through the link
+        typically holds &gt;15% energy in 1.5–3 Hz with a stable peak; standing still keeps this near zero.
       </small>
     </Card>
   );
@@ -1617,7 +2333,7 @@ function BiorhythmStatus({ latest }: { latest: DerivedWindow | null }) {
         resp {latest.respiration_bpm == null ? "--" : `${latest.respiration_bpm.toFixed(1)} bpm`} · {respConf}
       </span>
       <span className={`bandBadge confidence-${hrConf.toLowerCase()}`}>
-        HR* {latest.heart_rate_proxy_bpm == null ? "--" : `${latest.heart_rate_proxy_bpm.toFixed(0)} bpm`} · {hrConf}
+        peak 0.8–2.5 Hz {latest.heart_rate_proxy_bpm == null ? "--" : `${latest.heart_rate_proxy_bpm.toFixed(0)} bpm`} · {hrConf}
       </span>
       <span className="bandBadge">
         FFT window {window != null ? `${window.toFixed(1)} s` : "--"} · {rate != null ? `${rate.toFixed(1)} Hz` : "-- Hz"}

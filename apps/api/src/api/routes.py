@@ -80,7 +80,9 @@ def build_router(state: RuntimeState) -> APIRouter:
             tx_status = "no_rx_frames_yet"   # cannot confirm or deny
         # RX status: tied to whether the host is actually decoding frames,
         # not just whether the COM port string is set.
-        if snap.frames_seen == 0:
+        if state.last_source_error and snap.frames_seen == 0:
+            rx_status = "serial_open_failing"
+        elif snap.frames_seen == 0:
             rx_status = "not_streaming" if settings.serial_port else "not_configured"
         elif snap.last_frame_age_s is None or snap.last_frame_age_s < 5.0:
             rx_status = "streaming"
@@ -104,6 +106,8 @@ def build_router(state: RuntimeState) -> APIRouter:
                 "firmware_dropped": snap.firmware_dropped,
                 "firmware_queue_depth": snap.firmware_queue_depth,
                 "last_frame_age_s": snap.last_frame_age_s,
+                "last_error": state.last_source_error,
+                "last_error_kind": state.last_source_error_kind,
             },
             "host": {"api": "healthy"},
         }
@@ -362,5 +366,85 @@ def build_router(state: RuntimeState) -> APIRouter:
         completes.
         """
         return state.subcarrier_diagnostics()
+
+    @router.get("/presets")
+    async def list_presets() -> dict[str, object]:
+        """List recorded sessions available as one-click replay presets.
+
+        Item 9.2: hardware is finicky and the demo has to be reproducible.
+        We scan ``data/recordings/*.jsonl`` (raw frames) and pair each
+        with its derived counterpart if present. The frontend offers
+        these as buttons in the Live Control Bar so a presenter can
+        deterministically play back a known-good scenario.
+        """
+        from pathlib import Path
+
+        settings = get_settings()
+        recordings = settings.data_dir / "recordings"
+        if not recordings.exists():
+            return {"presets": []}
+        presets: list[dict[str, object]] = []
+        for path in sorted(recordings.glob("*.jsonl")):
+            # Skip derived sidecars (".derived.jsonl") and parquet exports.
+            if path.name.endswith(".derived.jsonl"):
+                continue
+            try:
+                size_bytes = path.stat().st_size
+            except OSError:
+                continue
+            # Cheap line count via a stat-based heuristic: assume ~1700
+            # bytes per JSON frame so we don't reload the file. Caller
+            # treats it as approximate.
+            est_frames = max(1, size_bytes // 1700)
+            label = path.stem
+            presets.append(
+                {
+                    "id": path.stem,
+                    "label": label,
+                    "path": str(path),
+                    "size_bytes": int(size_bytes),
+                    "estimated_frames": int(est_frames),
+                    "has_derived": (recordings / f"{path.stem}.derived.jsonl").exists(),
+                }
+            )
+        return {"presets": presets}
+
+    class PresetStart(BaseModel):
+        preset_id: str
+        rate_hz: float = 20.0
+
+    @router.post("/presets/start")
+    async def start_preset(payload: PresetStart) -> dict[str, object]:
+        """Create + start a session backed by the given recorded preset.
+
+        Equivalent to: POST /sessions {protocol: "replay_preset"} +
+        starting the replay against the preset path. Returns the session
+        record so the UI can attach to it.
+        """
+        from pathlib import Path
+
+        settings = get_settings()
+        recordings = settings.data_dir / "recordings"
+        candidate = recordings / f"{payload.preset_id}.jsonl"
+        if not candidate.exists() or not candidate.is_file():
+            raise HTTPException(status_code=404, detail=f"preset {payload.preset_id!r} not found")
+        # Stop any running source so the new replay isn't fighting it.
+        await state.stop()
+        session = state.store.create_session(
+            source_mode=SourceMode.REPLAY,
+            protocol="replay_preset",
+            notes=f"preset:{payload.preset_id}",
+        )
+        session_id = str(session["session_id"])
+        state.store.start_session(session_id)
+        state.active_session_id = session_id
+        await state.start_replay(path=str(candidate), packet_rate_hz=float(payload.rate_hz))
+        logger.info(
+            "[route] start_preset id=%s session=%s rate=%.1fHz",
+            payload.preset_id,
+            session_id,
+            payload.rate_hz,
+        )
+        return {"session": session, "preset_id": payload.preset_id}
 
     return router

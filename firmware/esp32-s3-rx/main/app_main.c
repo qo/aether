@@ -144,7 +144,17 @@ void app_main(void)
     wifi_init_sta();
     xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
     rv_csi_init();
-    xTaskCreate(udp_sink_task, "rv_udp_sink", 4096, NULL, 4, NULL);
-    xTaskCreate(serial_task, "rv_serial", 8192, NULL, 5, NULL);
-    ESP_LOGI(TAG, "RX ready");
+    /* Pin tasks to specific cores. The Wi-Fi stack and the LWIP TCP/IP
+     * thread run on PRO_CPU (core 0) by default; the CSI rx callback also
+     * runs in that context. Pinning the serial drain to APP_CPU (core 1)
+     * means the per-frame snprintf + UART write don't compete with the
+     * Wi-Fi task for cycles on every packet, which matters when we're
+     * trying to sustain 20 Hz with a non-trivial JSON payload.
+     *
+     * UDP sink stays on core 0 alongside Wi-Fi/LWIP — its workload is
+     * basically idle waiting on recv(), and keeping it co-located with
+     * the network stack avoids a cross-core wake on every packet. */
+    xTaskCreatePinnedToCore(udp_sink_task, "rv_udp_sink", 4096, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(serial_task,   "rv_serial",   8192, NULL, 5, NULL, 1);
+    ESP_LOGI(TAG, "RX ready (UART 921600, CSI queue 64, serial pinned to APP_CPU)");
 }

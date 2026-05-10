@@ -67,6 +67,14 @@ class BaselineCalibrator:
         self._motion_observed_max: float = 0.0
         self._last_rejection_reason: str | None = None
         self._accepted: bool = False
+        # Drift tracking (item 8.3). EWMA of per-subcarrier amplitude during
+        # post-calibration "still" frames. Compared periodically with the
+        # captured baseline to detect thermal/AGC/scene drift that would
+        # invalidate downstream motion + occupancy thresholds.
+        self._drift_ewma: np.ndarray | None = None
+        self._drift_alpha: float = 0.05  # ~20-frame time constant
+        self._drift_score: float = 0.0
+        self._drift_samples: int = 0
 
     @property
     def is_calibrated(self) -> bool:
@@ -305,4 +313,111 @@ class BaselineCalibrator:
             "progress": self.progress,
             "last_rejection_reason": self._last_rejection_reason,
             "accepted": self._accepted,
+            "drift_score": float(self._drift_score),
+            "drift_samples": int(self._drift_samples),
+            "drift_detected": bool(self.is_drifting()),
         }
+
+    # ---------- Drift detection (item 8.3) ----------
+
+    DRIFT_WARN_THRESHOLD: float = 0.18
+    """RMS-relative drift above this triggers ``drift_detected=True``.
+
+    The score is computed as ``rms(ewma - baseline) / rms(baseline)`` so
+    a value of 0.18 corresponds roughly to "the per-subcarrier amplitude
+    has drifted 18% on average from the captured baseline." That's well
+    past thermal jitter (~3-5%) but below a fully different scene.
+    """
+
+    def feed_idle_amplitude(self, amplitude: np.ndarray) -> None:
+        """Update the drift EWMA with a frame the runtime believes is "still".
+
+        The runtime calls this only when motion is below the stillness
+        threshold AND a baseline is calibrated. Outside those conditions
+        we'd be feeding noise into the EWMA and producing false alarms.
+        """
+        if self._mean is None or amplitude.ndim != 1 or amplitude.size == 0:
+            return
+        if amplitude.size != self._mean.size:
+            return  # subcarrier count changed; ignore until next calibration
+        amp = amplitude.astype(np.float64)
+        if self._drift_ewma is None:
+            self._drift_ewma = amp.copy()
+        else:
+            a = float(self._drift_alpha)
+            self._drift_ewma = (1.0 - a) * self._drift_ewma + a * amp
+        self._drift_samples += 1
+        baseline = self._mean
+        rms_baseline = float(np.sqrt(np.mean(baseline ** 2))) + 1e-9
+        rms_delta = float(np.sqrt(np.mean((self._drift_ewma - baseline) ** 2)))
+        self._drift_score = rms_delta / rms_baseline
+
+    def is_drifting(self) -> bool:
+        """True if the drift EWMA has diverged from baseline beyond threshold.
+
+        Requires at least ~50 still samples accumulated post-calibration to
+        avoid declaring drift on the first wobble of a fresh capture.
+        """
+        return (
+            self.is_calibrated
+            and self._drift_samples >= 50
+            and self._drift_score >= self.DRIFT_WARN_THRESHOLD
+        )
+
+    # ---------- Persistence (item 8.2) ----------
+    #
+    # The Welford-state (n, mean, M2) is enough to fully reconstruct the
+    # calibrator. We round to float for JSON friendliness and store
+    # acceptance metadata so a restored calibrator behaves identically to
+    # one that just finished its own capture.
+
+    def to_persisted_dict(self) -> dict[str, object] | None:
+        """Return a JSON-serialisable snapshot or None if not calibrated."""
+        if not self.is_calibrated or self._mean is None or self._m2 is None:
+            return None
+        first_ns = int(self._first_ts_ns) if self._first_ts_ns is not None else None
+        last_ns = int(self._last_ts_ns) if self._last_ts_ns is not None else None
+        return {
+            "version": 1,
+            "n": int(self._n),
+            "mean": self._mean.tolist(),
+            "m2": self._m2.tolist(),
+            "first_ts_ns": first_ns,
+            "last_ts_ns": last_ns,
+            "target_seconds": float(self._target_seconds),
+            "accepted": True,
+            "rssi_samples_n": len(self._rssi_samples),
+            "motion_observed_max": float(self._motion_observed_max),
+        }
+
+    @classmethod
+    def from_persisted_dict(cls, payload: dict[str, object]) -> "BaselineCalibrator":
+        """Rebuild a calibrator from a previously persisted snapshot.
+
+        Tolerates missing fields by falling back to safe defaults — a
+        partial payload simply produces a calibrator with reduced metadata
+        but still-valid mean/std arrays.
+        """
+        cal = cls()
+        if int(payload.get("version", 1)) != 1:
+            return cal  # unknown schema — start fresh
+        try:
+            mean = np.asarray(payload.get("mean", []), dtype=np.float64)
+            m2 = np.asarray(payload.get("m2", []), dtype=np.float64)
+        except (TypeError, ValueError):
+            return cal
+        if mean.size == 0 or mean.size != m2.size:
+            return cal
+        cal._n = int(payload.get("n", 0))
+        cal._mean = mean
+        cal._m2 = m2
+        first = payload.get("first_ts_ns")
+        last = payload.get("last_ts_ns")
+        cal._first_ts_ns = int(first) if isinstance(first, int) else None
+        cal._last_ts_ns = int(last) if isinstance(last, int) else None
+        cal._target_seconds = float(payload.get("target_seconds", 0.0))
+        cal._motion_observed_max = float(payload.get("motion_observed_max", 0.0))
+        cal._calibrating = False
+        cal._accepted = bool(payload.get("accepted", True))
+        cal._last_rejection_reason = None
+        return cal

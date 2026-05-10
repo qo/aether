@@ -212,6 +212,33 @@ export async function getLatestFrames(sessionId: string, n = 50): Promise<{
   return response.json();
 }
 
+export interface DemoPreset {
+  id: string;
+  label: string;
+  path: string;
+  size_bytes: number;
+  estimated_frames: number;
+  has_derived: boolean;
+}
+
+export async function listPresets(): Promise<{ presets: DemoPreset[] }> {
+  const response = await rvFetch(`${apiBase}/presets`, { cache: "no-store" }, "presets:list");
+  return response.json();
+}
+
+export async function startPreset(presetId: string, rateHz = 20): Promise<{ session: SessionRecord; preset_id: string }> {
+  const response = await rvFetch(
+    `${apiBase}/presets/start`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ preset_id: presetId, rate_hz: rateHz }),
+    },
+    `presets:start[${presetId}]`,
+  );
+  return response.json();
+}
+
 export async function getRoomGeometry(): Promise<RoomGeometry> {
   const response = await rvFetch(
     `${apiBase}/room/geometry`,
@@ -258,7 +285,7 @@ export interface LiveConnection {
 export function connectLive(
   onMessage: (message: LiveMessage) => void,
   onStatus: (status: string) => void,
-  options: { topics?: string[] } = {}
+  options: { topics?: string[]; batched?: boolean } = {}
 ): LiveConnection {
   let socket: WebSocket | null = null;
   let stopped = false;
@@ -266,6 +293,40 @@ export function connectLive(
   let attempt = 0;
   let desiredTopics: string[] = options.topics ? [...options.topics] : ["derived_window"];
   const tickRecv = makeRateCounter("ws", "frames received");
+
+  /*
+   * rAF-batched dispatch.
+   *
+   * The WS arrives at 20 Hz; React's reconciler is happiest at the browser's
+   * paint cadence (60 Hz max). Calling onMessage per WS message means the
+   * caller's state setter fires 20×/s, each producing a render; if multiple
+   * messages arrive in the same frame, that's wasted work. We buffer arrivals
+   * and drain them on the next animation frame — multiple windows collapse
+   * into one render path. Pure win: no data dropped, just batched delivery.
+   *
+   * Exception: non-derived-window messages (hello, subscribed, raw_frame)
+   * are dispatched immediately — they're either control plane or
+   * already rate-limited server-side.
+   */
+  const batched = options.batched !== false;
+  let pending: LiveMessage[] = [];
+  let rafToken: number | null = null;
+  const dispatchQueue = () => {
+    rafToken = null;
+    const queue = pending;
+    pending = [];
+    for (const msg of queue) onMessage(msg);
+  };
+  const enqueue = (msg: LiveMessage) => {
+    if (!batched) {
+      onMessage(msg);
+      return;
+    }
+    pending.push(msg);
+    if (rafToken == null) {
+      rafToken = (globalThis.requestAnimationFrame ?? ((cb: FrameRequestCallback) => globalThis.setTimeout(() => cb(performance.now()), 16)))(dispatchQueue) as unknown as number;
+    }
+  };
 
   const sendSubscribe = () => {
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
@@ -301,15 +362,27 @@ export function connectLive(
       });
       retry = globalThis.setTimeout(open, 2500);
     };
-    socket.onerror = (event) => {
-      onStatus("error");
-      devlog.error("ws", "error event", { event });
+    socket.onerror = () => {
+      // Browsers fire `error` immediately before `close` for any failed open
+      // or dropped link. The Event payload has no useful info (security
+      // sandbox), so logging it produces "[rv:ws] error event { event:
+      // [object Event] }" noise on every dev hot-reload. Let `onclose`
+      // handle the user-facing transition with code/reason.
       socket?.close();
     };
     socket.onmessage = (event) => {
       tickRecv();
       try {
-        onMessage(JSON.parse(event.data) as LiveMessage);
+        const msg = JSON.parse(event.data) as LiveMessage;
+        // Control-plane / non-derived: dispatch immediately so React state
+        // for connection status / hello reflects truth without waiting on
+        // the next frame.
+        const t = (msg as { type?: string }).type;
+        if (t && t !== "derived_window") {
+          onMessage(msg);
+        } else {
+          enqueue(msg);
+        }
       } catch (err) {
         const sample = typeof event.data === "string" ? event.data.slice(0, 200) : "<binary>";
         devlog.warn("ws", "malformed message; could not JSON.parse", { error: err, sample });
@@ -325,6 +398,9 @@ export function connectLive(
       stopped = true;
       devlog.info("ws", "client requested disconnect");
       if (retry) globalThis.clearTimeout(retry);
+      if (rafToken != null && globalThis.cancelAnimationFrame) {
+        globalThis.cancelAnimationFrame(rafToken);
+      }
       socket?.close();
     },
     subscribe: (topics: string[]) => {

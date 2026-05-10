@@ -54,7 +54,16 @@ uint32_t rv_csi_queue_pending(void)
 
 void rv_csi_init(void)
 {
-    s_csi_queue = xQueueCreate(32, sizeof(rv_csi_packet_t));
+    /* Queue capacity 64 (was 32). Each rv_csi_packet_t is ~410 bytes, so
+     * total queue RAM is ~26 KB — comfortable on ESP32-S3's ~512 KB SRAM.
+     *
+     * Why 64? With UART now at 921600 baud the serial task drains faster
+     * than Wi-Fi produces in steady state. The deeper queue is purely a
+     * jitter cushion for: (a) the boot transient before the host opens
+     * the port and starts reading, (b) brief stalls on the host side
+     * (GC, scheduler hiccup, log flush). 32 was too small to absorb a
+     * 0.5 s host pause without dropping; 64 absorbs ~3 s at 20 Hz. */
+    s_csi_queue = xQueueCreate(64, sizeof(rv_csi_packet_t));
     wifi_csi_config_t csi_config = {
         .lltf_en = true,
         .htltf_en = true,
@@ -68,7 +77,7 @@ void rv_csi_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(csi_rx_cb, NULL));
     ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));
     ESP_ERROR_CHECK(esp_wifi_set_csi(true));
-    ESP_LOGI(TAG, "CSI enabled");
+    ESP_LOGI(TAG, "CSI enabled (queue depth 64)");
 }
 
 bool rv_csi_receive(rv_csi_packet_t *packet, uint32_t timeout_ms)

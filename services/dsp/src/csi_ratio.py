@@ -74,6 +74,29 @@ def csi_ratio_magnitude(complex_matrix: np.ndarray, *, stride: int = 1) -> np.nd
     return np.abs(ratios).astype(np.float64)
 
 
+def csi_ratio_phase(complex_matrix: np.ndarray, *, stride: int = 1) -> np.ndarray:
+    """Phase of the CSI ratio, unwrapped along the time axis.
+
+    For each subcarrier-pair k the time series is the *phase* of
+    csi[t, k] / csi[t, k+stride]. The CFO/STO common-mode term cancels in
+    the ratio (same as for magnitude), but the phase carries Doppler-like
+    information about how the propagation path length is changing — body
+    motion towards/away from the link causes a smooth phase drift, which
+    on real hardware often gives a higher-SNR breathing signal than the
+    magnitude path.
+
+    Returns (T, S - stride) real array of unwrapped phases. Empty matrix
+    on degenerate input.
+    """
+    ratios = csi_ratio_pairs(complex_matrix, stride=stride)
+    if ratios.ndim != 2 or ratios.shape[1] == 0 or ratios.shape[0] == 0:
+        return np.zeros((ratios.shape[0] if ratios.ndim == 2 else 0, 0), dtype=np.float64)
+    angle = np.angle(ratios).astype(np.float64)
+    # Unwrap along the time axis (axis 0) so a 2π discontinuity between
+    # two consecutive frames doesn't masquerade as a real motion event.
+    return np.unwrap(angle, axis=0)
+
+
 def best_ratio_subcarriers(
     ratio_magnitude: np.ndarray,
     *,

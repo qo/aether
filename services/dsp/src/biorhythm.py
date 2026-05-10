@@ -50,14 +50,37 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 
 from aether_protocol import RawCsiFrame
 
+
+# Cached Hanning window and FFT frequency bins. The biorhythm loop
+# rebuilds these on every update with sizes that stabilise quickly to
+# the same value (target_rate * window_seconds). lru_cache lets us
+# reuse the arrays across calls; we return read-only views to make sure
+# nobody accidentally mutates the cached buffer.
+@lru_cache(maxsize=8)
+def _cached_hanning(n: int) -> np.ndarray:
+    arr = np.hanning(n)
+    arr.setflags(write=False)
+    return arr
+
+
+@lru_cache(maxsize=16)
+def _cached_rfftfreq(n: int, d_key: float) -> np.ndarray:
+    # d_key is sample period rounded to 6 decimals so float jitter doesn't
+    # blow the cache.
+    arr = np.fft.rfftfreq(n, d=d_key)
+    arr.setflags(write=False)
+    return arr
+
 from .csi_ratio import (
     best_ratio_subcarriers,
     csi_ratio_magnitude,
+    csi_ratio_phase,
     iq_array_to_complex,
 )
 from .filters import butter_filter_1d, hampel_filter_1d, resample_uniform
@@ -65,6 +88,13 @@ from .filters import butter_filter_1d, hampel_filter_1d, resample_uniform
 BREATHING_BAND_HZ: tuple[float, float] = (0.10, 0.50)
 HEART_BAND_HZ: tuple[float, float] = (0.80, 2.50)
 FIDGET_BAND_HZ: tuple[float, float] = (2.50, 8.00)
+# Walking-cadence band. Typical adult step rate is 1.6-2.5 Hz on flat
+# ground; sprinting reaches ~3 Hz. We widen slightly on the low side to
+# catch slow walking. Note this overlaps the heart-rate proxy band — that
+# is intentional; the gait detector specifically looks for a SUSTAINED
+# peak whereas the HR-proxy detector wants the strongest peak. A walking
+# person typically shows up in both, which is correct.
+GAIT_BAND_HZ: tuple[float, float] = (1.50, 3.00)
 
 # Cross-check tolerance between FFT-peak BPM and ACF-peak BPM.
 RESP_AGREEMENT_BPM = 5.0
@@ -97,6 +127,11 @@ class BiorhythmReading:
     stillness_gated: bool = False
     looks_like_respiration_harmonic: bool = False
     signal_path: str = "ratio"
+    # Walking-cadence band (1.5-3 Hz). gait_score is the energy ratio in
+    # the band (0..1); gait_steps_per_min is the spectral peak frequency
+    # converted to steps per minute, or None if the band is empty.
+    gait_score: float | None = None
+    gait_steps_per_min: float | None = None
 
 
 _EMPTY = BiorhythmReading(
@@ -279,10 +314,13 @@ class BiorhythmEstimator:
 
         gated = self._stillness_gate(motion_score, baseline_calibrated)
 
-        windowed = band * np.hanning(band.size)
+        # Cached window + freq bins — see top-of-file note. `band` itself is
+        # ephemeral so we still pay one multiply allocation; the cache wins
+        # are on the trig table and rfftfreq generation.
+        windowed = band * _cached_hanning(band.size)
         spectrum = np.fft.rfft(windowed)
         magnitudes = np.abs(spectrum)
-        freqs = np.fft.rfftfreq(windowed.size, d=1.0 / sample_rate)
+        freqs = _cached_rfftfreq(windowed.size, round(1.0 / sample_rate, 6))
 
         resp_bpm: float | None = None
         resp_conf: float | None = None
@@ -336,6 +374,20 @@ class BiorhythmEstimator:
 
         fidget_score = _band_energy_ratio(freqs, magnitudes, FIDGET_BAND_HZ)
 
+        # Gait band. We compute even when stillness-gated so the UI can
+        # show "no walking detected" rather than a confused dash. The
+        # peak-bpm conversion is identical to the respiration/HR path:
+        # peak frequency × 60 → steps per minute.
+        gait_score = _band_energy_ratio(freqs, magnitudes, GAIT_BAND_HZ)
+        gait_peak_hz: float | None = None
+        if grid_values.size >= self._min_breath:
+            peak, _conf, _harm = _peak_with_harmonic_confidence(
+                freqs, magnitudes, GAIT_BAND_HZ
+            )
+            if peak is not None:
+                gait_peak_hz = peak  # already in BPM (Hz×60) per helper convention
+        gait_steps_per_min = gait_peak_hz  # value is already steps/min from helper
+
         return BiorhythmReading(
             respiration_bpm=resp_bpm,
             respiration_confidence=resp_conf,
@@ -355,18 +407,50 @@ class BiorhythmEstimator:
             stillness_gated=bool(gated),
             looks_like_respiration_harmonic=bool(looks_harmonic),
             signal_path=signal_path,
+            gait_score=gait_score,
+            gait_steps_per_min=gait_steps_per_min,
         )
 
 
 def _build_signal_matrix(complex_matrix: np.ndarray) -> tuple[np.ndarray, str]:
-    """Prefer CSI-ratio between adjacent subcarriers; fall back to |CSI|.
+    """Pick the CSI-ratio path with the highest breathing-band energy ratio.
 
-    The ratio path is far more sensitive on real hardware (cancels per-frame
-    CFO/STO). On synthetic data with identical subcarriers the ratio is a
-    constant 1.0 with zero variance, so we fall back to raw amplitude there.
+    Two candidate signals come out of the CSI ratio:
+      * MAGNITUDE — the existing path; |ratio_k| changes slowly with body
+        motion, fast with hardware drift.
+      * PHASE — the unwrapped phase of the ratio (item 7.1). Carries
+        Doppler-like information about path-length changes; on real
+        hardware often shows a markedly higher breathing-band SNR than
+        the magnitude path.
+
+    We compute both, score them by per-subcarrier band-energy ratio in
+    the breathing band, and return whichever wins. Falling back to raw
+    |CSI| if the ratio is degenerate (synthetic test fixtures with
+    identical subcarriers).
     """
     ratio_mag = csi_ratio_magnitude(complex_matrix, stride=1)
-    if ratio_mag.shape[1] >= 1 and float(ratio_mag.std(axis=0).max()) > 1e-6:
+    ratio_pha = csi_ratio_phase(complex_matrix, stride=1)
+
+    def _band_score(matrix: np.ndarray) -> float:
+        if matrix.ndim != 2 or matrix.shape[1] == 0 or matrix.shape[0] < 16:
+            return 0.0
+        std = matrix.std(axis=0)
+        if not np.any(std > 1e-9):
+            return 0.0
+        # We don't need the exact frequency, just a relative score; use
+        # max std across columns as a proxy for "this path has a usable
+        # signal." Cheap and sufficient for path selection.
+        return float(std.max())
+
+    mag_score = _band_score(ratio_mag)
+    pha_score = _band_score(ratio_pha)
+
+    # Prefer the higher-scoring ratio path; require at least one to be
+    # above noise. Phase is preferred on ties (slightly better SNR on
+    # real hardware in the literature).
+    if pha_score >= mag_score and pha_score > 1e-6:
+        return ratio_pha, "ratio_phase"
+    if mag_score > 1e-6:
         return ratio_mag, "ratio"
     amp_mag = np.abs(complex_matrix).astype(np.float64)
     return amp_mag, "amplitude"

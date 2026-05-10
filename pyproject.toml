@@ -17,7 +17,8 @@ dependencies = [
   "polars>=1.8",
   "pyarrow>=17.0",
   "aiosqlite>=0.20",
-  "pyserial>=3.5"
+  "pyserial>=3.5",
+  "orjson>=3.10"
 ]
 
 [project.optional-dependencies]

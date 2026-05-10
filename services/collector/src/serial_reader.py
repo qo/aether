@@ -88,8 +88,25 @@ async def read_serial_frames(
 
         except serial.SerialException as exc:  # type: ignore[attr-defined]
             logger.warning("serial port error on %s: %s; retry in %.1fs", port, exc, backoff)
+            # Yield an error envelope so the runtime can surface this in the
+            # /devices payload. Without it, a misconfigured COM port produces
+            # log spam but a silent UI ("no frames yet" forever).
+            yield {
+                "type": "source_error",
+                "kind": "serial_exception",
+                "error": str(exc),
+                "port": port,
+                "retry_in_s": backoff,
+            }
         except OSError as exc:
             logger.warning("serial OSError on %s: %s; retry in %.1fs", port, exc, backoff)
+            yield {
+                "type": "source_error",
+                "kind": "os_error",
+                "error": str(exc),
+                "port": port,
+                "retry_in_s": backoff,
+            }
         finally:
             if serial_port is not None:
                 try:

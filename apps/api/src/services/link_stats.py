@@ -166,9 +166,15 @@ class LinkStats:
                     "(CSI queue overflowed)"
                 )
             if self._fw_queue_depth and self._fw_queue_depth > 4:
+                # Host can't drain a firmware-side queue — that lives on the
+                # ESP. A persistently-full queue + drops means firmware can't
+                # produce CSI faster than its task budget allows, or UART is
+                # backpressuring. The host is reading every byte the port
+                # gives it; nothing the host does will reduce this.
                 notes.append(
-                    f"firmware queue depth {self._fw_queue_depth} — host is "
-                    "not draining fast enough"
+                    f"firmware queue depth {self._fw_queue_depth} — firmware "
+                    "is producing CSI faster than it can emit on UART (host "
+                    "drains every byte it sees)"
                 )
             if last_age is not None and last_age > 2.0:
                 notes.append(

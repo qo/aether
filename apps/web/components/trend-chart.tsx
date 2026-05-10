@@ -2,7 +2,7 @@
 
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
-import { useEffect, useRef } from "react";
+import { memo, useEffect, useMemo, useRef } from "react";
 import type { DerivedWindow } from "../lib/types";
 import { EmptyState } from "./empty-state";
 
@@ -15,7 +15,17 @@ export interface TrendSeries {
   dash?: number[];
 }
 
-export function TrendChart({
+/*
+ * Incremental uPlot trend chart.
+ *
+ * The previous implementation destroyed and recreated the entire uPlot
+ * instance on every windows change — i.e. ~20 times/sec at full WS
+ * cadence. uPlot has a `setData()` path that updates the series in place
+ * with a single canvas redraw. We use that for steady-state updates and
+ * only rebuild when the *shape* of the chart changes (number of series,
+ * height, scales).
+ */
+function TrendChartImpl({
   windows,
   series,
   height = 240,
@@ -28,19 +38,24 @@ export function TrendChart({
 }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<uPlot | null>(null);
+  const seriesRef = useRef<TrendSeries[]>(series);
+  seriesRef.current = series;
 
+  // Stable signature for the chart's "shape" — when this changes we tear
+  // down + rebuild. When only `windows` changes we hit the setData fast path.
+  const shapeKey = useMemo(() => {
+    return [
+      height,
+      series.length,
+      ...series.map((s) => `${s.label}|${s.stroke}|${s.scale ?? "y"}|${s.dash?.join(",") ?? ""}|${s.width ?? ""}`)
+    ].join("::");
+  }, [height, series]);
+
+  // (Re)build the chart only when the shape changes.
   useEffect(() => {
     const host = hostRef.current;
-    if (!host || !windows.length) return;
+    if (!host) return;
     host.innerHTML = "";
-    const last = windows.slice(-120);
-    const x = last.map((w) => w.window_end_ns / 1_000_000_000);
-    const cols = series.map((s) =>
-      last.map((w) => {
-        const v = s.pick(w);
-        return v == null || !Number.isFinite(v) ? null : v;
-      })
-    );
     const usedScales = new Set(series.map((s) => s.scale ?? "y"));
     const axes: uPlot.Axis[] = [
       { stroke: "#8B91A8" },
@@ -73,13 +88,30 @@ export function TrendChart({
         }))
       ]
     };
-    const chart = new uPlot(opts, [x, ...cols] as unknown as uPlot.AlignedData, host);
+    // Seed with empty data; the setData effect below populates it.
+    const chart = new uPlot(opts, [[], ...series.map(() => [])] as unknown as uPlot.AlignedData, host);
     chartRef.current = chart;
     return () => {
       chart.destroy();
       chartRef.current = null;
     };
-  }, [windows, series, height]);
+  }, [shapeKey]);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Fast path: when only data changes, push it via setData. No DOM teardown,
+  // no canvas reattach — uPlot redraws in-place.
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart || !windows.length) return;
+    const last = windows.slice(-120);
+    const x = last.map((w) => w.window_end_ns / 1_000_000_000);
+    const cols = seriesRef.current.map((s) =>
+      last.map((w) => {
+        const v = s.pick(w);
+        return v == null || !Number.isFinite(v) ? null : v;
+      })
+    );
+    chart.setData([x, ...cols] as unknown as uPlot.AlignedData);
+  }, [windows]);
 
   if (!windows.length) {
     return <EmptyState title="No trend data" message="Trends populate as derived windows arrive." />;
@@ -87,3 +119,20 @@ export function TrendChart({
 
   return <div className="uplotHost" ref={hostRef} aria-label={ariaLabel ?? "Trend chart"} />;
 }
+
+export const TrendChart = memo(TrendChartImpl, (prev, next) => {
+  // Re-render only when:
+  //  - height changed
+  //  - series shape changed (different list)
+  //  - the latest window changed (length or last window's end timestamp)
+  if (prev.height !== next.height) return false;
+  if (prev.series.length !== next.series.length) return false;
+  for (let i = 0; i < prev.series.length; i += 1) {
+    if (prev.series[i] !== next.series[i]) return false;
+  }
+  if (prev.windows.length !== next.windows.length) return false;
+  if (prev.windows.length === 0) return true;
+  const a = prev.windows[prev.windows.length - 1];
+  const b = next.windows[next.windows.length - 1];
+  return a?.window_end_ns === b?.window_end_ns;
+});

@@ -11,6 +11,10 @@
 static const char *TAG = "aether_csi";
 static QueueHandle_t s_csi_queue;
 static uint32_t s_seq;
+// Queue-overflow telemetry: incremented from the Wi-Fi-task ISR-context
+// callback when xQueueSend cannot enqueue. Read by serial_task to surface in
+// heartbeat lines so we can prove the host is/isn't draining fast enough.
+static volatile uint32_t s_dropped;
 
 static void csi_rx_cb(void *ctx, wifi_csi_info_t *data)
 {
@@ -33,7 +37,19 @@ static void csi_rx_cb(void *ctx, wifi_csi_info_t *data)
     packet.len = data->len > RV_MAX_CSI_BYTES ? RV_MAX_CSI_BYTES : data->len;
     memcpy(packet.buf, data->buf, packet.len);
 
-    (void)xQueueSend(s_csi_queue, &packet, 0);
+    if (xQueueSend(s_csi_queue, &packet, 0) != pdTRUE) {
+        s_dropped++;
+    }
+}
+
+uint32_t rv_csi_dropped_count(void)
+{
+    return s_dropped;
+}
+
+uint32_t rv_csi_queue_pending(void)
+{
+    return s_csi_queue ? (uint32_t)uxQueueMessagesWaiting(s_csi_queue) : 0u;
 }
 
 void rv_csi_init(void)

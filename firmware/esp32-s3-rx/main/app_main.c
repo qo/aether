@@ -124,7 +124,9 @@ static void serial_task(void *arg)
         }
         int64_t now = esp_timer_get_time();
         if (now - last_heartbeat > 1000000) {
-            rv_serial_write_heartbeat(packets_seen);
+            rv_serial_write_heartbeat(packets_seen,
+                                      rv_csi_dropped_count(),
+                                      rv_csi_queue_pending());
             last_heartbeat = now;
         }
     }

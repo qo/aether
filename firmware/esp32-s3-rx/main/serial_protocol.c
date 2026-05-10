@@ -28,9 +28,18 @@ void rv_serial_write_csi(const rv_csi_packet_t *packet)
     printf("]}}\n");
 }
 
-void rv_serial_write_heartbeat(uint32_t packets_seen)
+void rv_serial_write_heartbeat(uint32_t packets_seen,
+                               uint32_t dropped,
+                               uint32_t queue_depth)
 {
-    printf("{\"type\":\"heartbeat\",\"firmware\":\"aether-rx-v0\",\"packets_seen\":%lu,\"uptime_us\":%lld}\n",
+    // queue_depth is messages currently buffered between the Wi-Fi callback
+    // and the serial task — a non-zero steady-state value means the host is
+    // not draining fast enough. dropped is monotonic since boot.
+    printf("{\"type\":\"heartbeat\",\"firmware\":\"aether-rx-v0\","
+           "\"packets_seen\":%lu,\"dropped\":%lu,\"queue_depth\":%lu,"
+           "\"uptime_us\":%lld}\n",
            packets_seen,
+           dropped,
+           queue_depth,
            esp_timer_get_time());
 }

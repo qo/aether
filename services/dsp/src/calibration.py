@@ -34,8 +34,24 @@ class BaselineSnapshot:
     snr_weights: list[float]
 
 
+# Acceptance thresholds for a baseline to be trusted. If any are exceeded
+# during the calibration window we mark the baseline as "rejected" so the
+# UI can prompt the operator to redo it instead of silently treating a
+# noisy capture as ground truth.
+_BASELINE_REJECT_RSSI_STD_DB = 4.0
+_BASELINE_REJECT_RATE_FLOOR_HZ = 5.0  # link must sustain at least this rate
+_BASELINE_MIN_FRAMES = 100
+
+
 class BaselineCalibrator:
-    """Rolling per-subcarrier baseline. Streaming Welford accumulator."""
+    """Rolling per-subcarrier baseline. Streaming Welford accumulator.
+
+    Calibration acceptance: a baseline is only marked "calibrated" when the
+    observed link during the calibration window cleared a few sanity gates
+    (enough frames, RSSI std bounded, no obvious motion). When rejected, the
+    calibrator stays in 'is_calibrating=False, is_calibrated=False' with a
+    populated ``last_rejection_reason`` so the UI can explain *why*.
+    """
 
     def __init__(self) -> None:
         self._n: int = 0
@@ -46,14 +62,23 @@ class BaselineCalibrator:
         self._calibrating: bool = False
         self._target_seconds: float = 0.0
         self._target_frames: int = 0
+        # Acceptance evidence accumulated during the calibration window.
+        self._rssi_samples: list[float] = []
+        self._motion_observed_max: float = 0.0
+        self._last_rejection_reason: str | None = None
+        self._accepted: bool = False
 
     @property
     def is_calibrated(self) -> bool:
-        return self._n > 0 and self._mean is not None
+        return self._accepted and self._n > 0 and self._mean is not None
 
     @property
     def is_calibrating(self) -> bool:
         return self._calibrating
+
+    @property
+    def last_rejection_reason(self) -> str | None:
+        return self._last_rejection_reason
 
     @property
     def frames_observed(self) -> int:
@@ -82,14 +107,31 @@ class BaselineCalibrator:
         self._calibrating = True
         self._target_seconds = max(0.5, float(duration_seconds))
         self._target_frames = 0
+        self._rssi_samples = []
+        self._motion_observed_max = 0.0
+        self._last_rejection_reason = None
+        self._accepted = False
 
     def cancel(self) -> None:
         self._calibrating = False
+        self._accepted = False
 
-    def feed(self, amplitude: np.ndarray, *, ts_host_ns: int) -> bool:
+    def feed(
+        self,
+        amplitude: np.ndarray,
+        *,
+        ts_host_ns: int,
+        rssi_dbm: float | None = None,
+        motion_score: float | None = None,
+    ) -> bool:
         """Push one frame's per-subcarrier amplitude into the accumulator.
 
-        Returns True if calibration just completed on this frame.
+        ``rssi_dbm`` and ``motion_score`` are advisory inputs used solely for
+        baseline acceptance — they are NOT mixed into the amplitude statistics.
+
+        Returns True if calibration just completed on this frame (whether
+        accepted or rejected — the caller should check ``is_calibrated`` /
+        ``last_rejection_reason``).
         """
         if not self._calibrating:
             return False
@@ -104,6 +146,8 @@ class BaselineCalibrator:
             self._mean = np.zeros_like(amplitude, dtype=np.float64)
             self._m2 = np.zeros_like(amplitude, dtype=np.float64)
             self._n = 0
+            self._rssi_samples = []
+            self._motion_observed_max = 0.0
 
         if self._first_ts_ns is None:
             self._first_ts_ns = int(ts_host_ns)
@@ -116,12 +160,65 @@ class BaselineCalibrator:
         assert self._m2 is not None  # for type-checker
         self._m2 += delta * delta2
 
-        # Done when we exceed the requested duration AND have a sane sample count.
+        if rssi_dbm is not None:
+            self._rssi_samples.append(float(rssi_dbm))
+        if motion_score is not None and motion_score > self._motion_observed_max:
+            self._motion_observed_max = float(motion_score)
+
         elapsed_s = (self._last_ts_ns - self._first_ts_ns) / 1_000_000_000
-        if elapsed_s >= self._target_seconds and self._n >= 32:
+        if elapsed_s >= self._target_seconds and self._n >= _BASELINE_MIN_FRAMES:
             self._calibrating = False
+            self._evaluate_acceptance(elapsed_s)
             return True
         return False
+
+    def _evaluate_acceptance(self, elapsed_s: float) -> None:
+        """Apply Phase B acceptance gates and record rejection reason if any."""
+        # Frame count gate (defensive — feed() already requires >= MIN_FRAMES).
+        if self._n < _BASELINE_MIN_FRAMES:
+            self._accepted = False
+            self._last_rejection_reason = (
+                f"only {self._n} frames captured during {elapsed_s:.1f}s "
+                f"(need {_BASELINE_MIN_FRAMES})"
+            )
+            return
+        # Effective rate gate — if we got 100 frames over 30 s on a "20 Hz" link
+        # something is wrong; do not bake that into a baseline.
+        observed_rate = self._n / max(elapsed_s, 1e-3)
+        if observed_rate < _BASELINE_REJECT_RATE_FLOOR_HZ:
+            self._accepted = False
+            self._last_rejection_reason = (
+                f"link rate {observed_rate:.1f} Hz is below the "
+                f"{_BASELINE_REJECT_RATE_FLOOR_HZ:.0f} Hz floor required for "
+                "a trustworthy baseline"
+            )
+            return
+        # RSSI stability gate — high std means AGC is fighting the link;
+        # the baseline std would be artificially inflated, which would
+        # under-call motion downstream.
+        if len(self._rssi_samples) >= 2:
+            rssi_arr = np.asarray(self._rssi_samples, dtype=np.float64)
+            rssi_std = float(rssi_arr.std())
+            if rssi_std > _BASELINE_REJECT_RSSI_STD_DB:
+                self._accepted = False
+                self._last_rejection_reason = (
+                    f"RSSI std {rssi_std:.1f} dB exceeded "
+                    f"{_BASELINE_REJECT_RSSI_STD_DB:.1f} dB — link too noisy "
+                    "for a stable empty-room baseline"
+                )
+                return
+        # Motion gate — operator was expected to keep the room empty/still.
+        # If a previous window already showed motion above the uncalibrated
+        # floor, the operator was probably moving during calibration.
+        if self._motion_observed_max > 6.0:
+            self._accepted = False
+            self._last_rejection_reason = (
+                f"detected motion (peak {self._motion_observed_max:.1f}) during "
+                "calibration — keep the room empty for the duration"
+            )
+            return
+        self._accepted = True
+        self._last_rejection_reason = None
 
     def baseline_amplitude(self) -> np.ndarray | None:
         return None if self._mean is None else self._mean.copy()
@@ -206,4 +303,6 @@ class BaselineCalibrator:
             "subcarrier_count": int(self._mean.size) if self._mean is not None else 0,
             "target_seconds": self._target_seconds,
             "progress": self.progress,
+            "last_rejection_reason": self._last_rejection_reason,
+            "accepted": self._accepted,
         }

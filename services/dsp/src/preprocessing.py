@@ -128,3 +128,26 @@ def select_subcarriers_by_variance(matrix: np.ndarray, *, top_k: int = 8) -> np.
     k = max(1, min(int(top_k), std.size))
     order = np.argsort(std)[::-1]
     return np.sort(order[:k])
+
+
+def remove_linear_phase_per_frame(phase_matrix: np.ndarray) -> np.ndarray:
+    """Strip per-frame linear phase (CFO + STO) from a (T, S) phase matrix.
+
+    Each row gets a least-squares line ``a * k + b`` fitted across the
+    subcarrier index ``k`` and subtracted, leaving the per-subcarrier phase
+    deviation. This is the standard PhaseFi-style detrend that turns raw
+    ESP32 phase output into something usable as a motion signal.
+
+    Returns a matrix of the same shape; if the input has fewer than two
+    subcarriers the matrix is returned unchanged.
+    """
+    if phase_matrix.ndim != 2 or phase_matrix.shape[1] < 2:
+        return phase_matrix
+    k = np.arange(phase_matrix.shape[1], dtype=np.float64)
+    out = np.empty_like(phase_matrix, dtype=np.float64)
+    for t in range(phase_matrix.shape[0]):
+        row = phase_matrix[t].astype(np.float64)
+        # np.polyfit handles NaN-free, length-N input cheaply for small N.
+        slope, intercept = np.polyfit(k, row, 1)
+        out[t] = row - (slope * k + intercept)
+    return out

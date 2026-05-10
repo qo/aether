@@ -6,7 +6,13 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
-from aether_protocol import DerivedWindow, ExperimentEvent, RawCsiFrame, SourceMode
+from aether_protocol import (
+    DerivedWindow,
+    ExperimentEvent,
+    RawCsiFrame,
+    RoomGeometry,
+    SourceMode,
+)
 
 
 class SessionStore:
@@ -48,6 +54,18 @@ class SessionStore:
                     session_id TEXT NOT NULL,
                     payload TEXT NOT NULL,
                     ts_host_ns INTEGER NOT NULL
+                )
+                """
+            )
+            # Phase E: operator-supplied room geometry. Single row keyed by
+            # the literal "current" — we don't track per-session geometry
+            # because it's a property of the physical install, not the run.
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS room_geometry (
+                    id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    updated_ns INTEGER NOT NULL
                 )
                 """
             )
@@ -112,6 +130,83 @@ class SessionStore:
                     event.ts_host_ns,
                 ),
             )
+
+    def get_room_geometry(self) -> RoomGeometry:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT payload FROM room_geometry WHERE id = 'current'"
+            ).fetchone()
+        if row is None:
+            return RoomGeometry()
+        try:
+            return RoomGeometry.model_validate_json(row["payload"])
+        except Exception:  # noqa: BLE001 — corrupted row, fall back to default
+            return RoomGeometry()
+
+    def set_room_geometry(self, geometry: RoomGeometry) -> RoomGeometry:
+        payload = geometry.model_copy(update={"updated_ns": time.time_ns()})
+        with self._connect() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO room_geometry (id, payload, updated_ns) "
+                "VALUES ('current', ?, ?)",
+                (payload.model_dump_json(), payload.updated_ns),
+            )
+        return payload
+
+    def read_raw_frames(
+        self,
+        session_id: str,
+        *,
+        from_ns: int | None = None,
+        to_ns: int | None = None,
+        limit: int = 200,
+        latest: bool = False,
+    ) -> list[dict[str, object]]:
+        """Read RawCsiFrames from the per-session JSONL.
+
+        Used by the new ``/sessions/{id}/frames`` route on the Raw-Sensor tab.
+        Streams the JSONL on demand so we don't load whole sessions into RAM
+        for large recordings; if ``latest`` is set, we read the tail-N which
+        requires walking the file once but is bounded by ``limit``.
+        """
+        path = self.recordings_dir / f"{session_id}.jsonl"
+        if not path.exists():
+            return []
+        out: list[dict[str, object]] = []
+        if latest:
+            # Tail-N: read the file linearly and keep a sliding window.
+            with path.open("r", encoding="utf-8") as handle:
+                tail: list[str] = []
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    tail.append(line)
+                    if len(tail) > limit:
+                        tail.pop(0)
+            for line in tail:
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+            return out
+        # Normal forward scan with optional time-range filter.
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = int(record.get("ts_host_ns", 0))
+                if from_ns is not None and ts < from_ns:
+                    continue
+                if to_ns is not None and ts > to_ns:
+                    continue
+                out.append(record)
+                if len(out) >= limit:
+                    break
+        return out
 
     def append_raw_frame(self, frame: RawCsiFrame) -> Path:
         path = self.recordings_dir / f"{frame.session_id}.jsonl"

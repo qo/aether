@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
+from typing import Any
 
 from aether_protocol import RawCsiFrame, SourceMode
 
@@ -23,8 +24,13 @@ async def read_serial_frames(
     port: str,
     baud: int,
     session_id: str,
-) -> AsyncIterator[RawCsiFrame]:
-    """Yield CSI frames from a serial port, with auto-reconnect.
+) -> AsyncIterator[RawCsiFrame | dict[str, Any]]:
+    """Yield CSI frames AND firmware envelopes from a serial port.
+
+    Each yielded value is either a ``RawCsiFrame`` (for ``type=csi`` lines) or
+    a ``dict`` (for ``type=heartbeat`` and ``type=status`` lines). Callers
+    must isinstance-dispatch — this lets the runtime feed the heartbeat
+    counters into LinkStats without a second reader path.
 
     Wraps pyserial in a watchdog/backoff loop. Three failure modes are handled:
 
@@ -74,6 +80,10 @@ async def read_serial_frames(
                     logger.debug("skip non-CSI serial line: %s", exc)
                     continue
                 if message.message_type == "csi":
+                    yield message.payload  # type: ignore[misc]
+                elif message.message_type == "heartbeat":
+                    # Firmware heartbeat envelope -> let the runtime route it
+                    # into LinkStats so we get queue / drop telemetry surfaced.
                     yield message.payload  # type: ignore[misc]
 
         except serial.SerialException as exc:  # type: ignore[attr-defined]

@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -86,6 +87,16 @@ static void udp_sender_task(void *arg)
         packet.payload[i] = (uint8_t)(i & 0xff);
     }
 
+    // Phase A cadence instrumentation: every CADENCE_LOG_EVERY packets we
+    // print measured min/avg/max inter-packet interval in microseconds.
+    // This is the ground truth for "did the TX really emit at 50 ms?"
+    const uint32_t CADENCE_LOG_EVERY = 200;
+    int64_t last_tx_us = 0;
+    int64_t cadence_min_us = INT64_MAX;
+    int64_t cadence_max_us = 0;
+    int64_t cadence_sum_us = 0;
+    uint32_t cadence_samples = 0;
+
     while (true) {
         uint8_t hello[32];
         struct sockaddr_in from = {0};
@@ -103,15 +114,38 @@ static void udp_sender_task(void *arg)
 
         packet.sequence++;
         packet.device_time_us = (uint64_t)esp_timer_get_time();
+
+        // Measure cadence between two successive transmits, not between
+        // vTaskDelay calls — the recvfrom above can drift the loop.
+        if (last_tx_us > 0) {
+            int64_t dt = (int64_t)packet.device_time_us - last_tx_us;
+            if (dt > 0) {
+                if (dt < cadence_min_us) cadence_min_us = dt;
+                if (dt > cadence_max_us) cadence_max_us = dt;
+                cadence_sum_us += dt;
+                cadence_samples++;
+            }
+        }
+        last_tx_us = (int64_t)packet.device_time_us;
+
         const struct sockaddr_in *dest = have_peer ? &peer_dest : &broadcast_dest;
         int sent = sendto(sock, &packet, sizeof(packet), 0, (const struct sockaddr *)dest, sizeof(*dest));
         if (sent < 0) {
             ESP_LOGW(TAG, "sendto failed");
-        } else if ((packet.sequence % 100) == 0) {
-            ESP_LOGI(TAG, "heartbeat type=tx_status seq=%lu interval_ms=%d mode=%s",
+        } else if ((packet.sequence % CADENCE_LOG_EVERY) == 0 && cadence_samples > 0) {
+            int64_t avg = cadence_sum_us / (int64_t)cadence_samples;
+            ESP_LOGI(TAG, "cadence seq=%lu samples=%lu min=%lldus avg=%lldus max=%lldus target=%dms mode=%s",
                      packet.sequence,
+                     cadence_samples,
+                     cadence_min_us,
+                     avg,
+                     cadence_max_us,
                      RV_TX_PACKET_INTERVAL_MS,
                      have_peer ? "unicast" : "broadcast");
+            cadence_min_us = INT64_MAX;
+            cadence_max_us = 0;
+            cadence_sum_us = 0;
+            cadence_samples = 0;
         }
         vTaskDelay(pdMS_TO_TICKS(RV_TX_PACKET_INTERVAL_MS));
     }

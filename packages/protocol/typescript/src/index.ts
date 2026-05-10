@@ -34,6 +34,10 @@ export interface DerivedWindow {
   amplitude_mean: number[];
   amplitude_std: number[];
   phase_unwrapped_mean: number[];
+  phase_unwrapped_std?: number[] | null;
+  motion_score_amplitude?: number | null;
+  motion_score_phase?: number | null;
+  responsive_subcarriers?: number[];
   motion_score: number;
   occupancy_score: number;
   respiration_bpm: number | null;
@@ -60,6 +64,54 @@ export interface DerivedWindow {
   expected_packet_rate_hz?: number | null;
   baseline_calibrated?: boolean;
   source_mode: SourceMode;
+}
+
+export interface RoomGeometry {
+  schema_version: "room_geometry.v1";
+  room_extent_m: [number, number, number];
+  tx_position_m: [number, number, number];
+  rx_position_m: [number, number, number];
+  tx_orientation_deg: number;
+  rx_orientation_deg: number;
+  subject_position_m?: [number, number, number] | null;
+  subject_radius_m: number;
+  notes?: string | null;
+  updated_ns: number;
+}
+
+export interface LinkDiagnostics {
+  schema_version: "link_diagnostics.v1";
+  observed_packet_rate_hz: number;
+  expected_packet_rate_hz: number;
+  expected_rate_source: string;
+  inter_arrival_p50_ms: number | null;
+  inter_arrival_p90_ms: number | null;
+  inter_arrival_p99_ms: number | null;
+  inter_arrival_max_ms: number | null;
+  inter_arrival_jitter_ms: number | null;
+  rssi_p50_dbm: number | null;
+  rssi_std_dbm: number | null;
+  noise_floor_p50_dbm: number | null;
+  first_word_invalid_ratio: number;
+  frames_seen: number;
+  firmware_packets_seen: number | null;
+  firmware_dropped: number | null;
+  firmware_queue_depth: number | null;
+  rate_stable: boolean;
+  last_frame_age_s: number | null;
+  notes: string[];
+}
+
+export interface SubcarrierDiagnostics {
+  schema_version: "subcarrier_diagnostics.v1";
+  is_calibrated: boolean;
+  subcarrier_count: number;
+  edges_dropped: number;
+  kept_indices?: number[];
+  responsive_indices: number[];
+  amplitude_mean: number[];
+  amplitude_std: number[];
+  snr_weights: number[];
 }
 
 export interface ExperimentEvent {

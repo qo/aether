@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aether.local/schemas/room_geometry.v1.json",
+  "title": "Operator-Supplied Room Geometry",
+  "description": "Local x/y/z layout of TX, RX, and (optional) subject, in metres. Operator data, not sensed. All position fields are nullable until the operator enters real measurements.",
+  "type": "object",
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": { "const": "room_geometry.v1" },
+    "room_extent_m": {
+      "type": ["array", "null"],
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "type": "number", "minimum": 0 }
+    },
+    "tx_position_m": {
+      "type": ["array", "null"],
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "type": "number" }
+    },
+    "rx_position_m": {
+      "type": ["array", "null"],
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "type": "number" }
+    },
+    "tx_orientation_deg": { "type": "number" },
+    "rx_orientation_deg": { "type": "number" },
+    "subject_position_m": {
+      "type": ["array", "null"],
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "type": "number" }
+    },
+    "subject_radius_m": { "type": "number", "exclusiveMinimum": 0 },
+    "notes": { "type": ["string", "null"] },
+    "updated_ns": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": false
+}

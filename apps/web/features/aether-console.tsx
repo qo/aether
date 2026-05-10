@@ -1,22 +1,10 @@
 "use client";
 
 import type { ColumnDef } from "@tanstack/react-table";
-import {
-  Bell,
-  BookOpen,
-  Database,
-  FlaskConical,
-  HardDrive,
-  Home,
-  MessageSquare,
-  Radio,
-  RefreshCw,
-  Settings,
-  Square,
-  Waves,
-} from "lucide-react";
+import { Bell, RefreshCw, Square, Waves } from "lucide-react";
 import type { ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { AmplitudeChart } from "../components/amplitude-chart";
 import { ConfidenceBadge } from "../components/confidence-badge";
 import { DataTable } from "../components/data-table";
@@ -99,8 +87,24 @@ const protocolDefinitions = [
   }
 ];
 
+function isPageName(value: string | null | undefined): value is PageName {
+  if (!value) return false;
+  return navSections.some((section) => (section.items as readonly string[]).includes(value));
+}
+
 export function RadioVisionConsole() {
-  const [page, setPage] = useState<PageName>("Live Room");
+  // Sub-page state is driven by the global shell's sidebar via ?page=… so
+  // links like "/home?page=Experiment+Console" route within the console
+  // without a full reload.
+  const searchParams = useSearchParams();
+  const queryPage = searchParams?.get("page") ?? null;
+  const initialPage: PageName = isPageName(queryPage) ? queryPage : "Live Room";
+  const [page, setPage] = useState<PageName>(initialPage);
+  useEffect(() => {
+    if (isPageName(queryPage) && queryPage !== page) {
+      setPage(queryPage);
+    }
+  }, [queryPage, page]);
   const [connectionStatus, setConnectionStatus] = useState("offline");
   const [sourceMode, setSourceMode] = useState<SourceMode | null>(null);
   const [windows, setWindows] = useState<DerivedWindow[]>([]);
@@ -148,7 +152,7 @@ export function RadioVisionConsole() {
 
   useEffect(() => {
     void refreshMetadata();
-    const disconnect = connectLive(
+    const conn = connectLive(
       (message) => {
         if (message.summary) {
           setSummary(message.summary);
@@ -167,7 +171,7 @@ export function RadioVisionConsole() {
     setWallClockMs(Date.now());
     const tick = window.setInterval(() => setWallClockMs(Date.now()), 1000);
     return () => {
-      disconnect();
+      conn.close();
       window.clearInterval(poll);
       window.clearInterval(tick);
     };
@@ -318,14 +322,7 @@ export function RadioVisionConsole() {
       : "no_frames_yet";
 
   return (
-    <main className="appShell">
-      <Sidebar
-        page={page}
-        setPage={setPage}
-        sourceMode={sourceMode}
-        connectionStatus={connectionStatus}
-        healthStatus={error ? "unavailable" : "healthy"}
-      />
+    <div className="appShell">
       <section className="mainPane">
         <TopBar page={page} activeSession={activeSession} sourceMode={sourceMode} onStop={() => void stopActiveSession()} />
         <div className="contentWrap">
@@ -385,7 +382,7 @@ export function RadioVisionConsole() {
           {page === "Settings" ? <SettingsPage /> : null}
         </div>
       </section>
-    </main>
+    </div>
   );
 
   async function stopActiveSession() {
@@ -417,52 +414,10 @@ export function RadioVisionConsole() {
   }
 }
 
-function Sidebar({
-  page,
-  setPage,
-  sourceMode,
-  connectionStatus,
-  healthStatus
-}: {
-  page: PageName;
-  setPage: (page: PageName) => void;
-  sourceMode: SourceMode | null;
-  connectionStatus: string;
-  healthStatus: string;
-}) {
-  return (
-    <aside className="sidebar">
-      <div className="brand">
-        <span className="brandMark">Æ</span>
-        <strong>Aether</strong>
-      </div>
-      <nav className="sideNav" aria-label="Primary navigation">
-        {navSections.map((section) => (
-          <div className="navSection" key={section.label}>
-            <span className="navLabel">{section.label}</span>
-            {section.items.map((item) => (
-              <button className={page === item ? "navItem active" : "navItem"} key={item} onClick={() => setPage(item)}>
-                {navIcon(item)}
-                <span>{item}</span>
-              </button>
-            ))}
-          </div>
-        ))}
-      </nav>
-      <div className="sidebarStatus">
-        <SourceBadge mode={connectionStatus === "connected" ? sourceMode : null} status={connectionStatus} />
-        <div className="statusRow">
-          <StatusDot status={healthStatus === "healthy" ? "success" : "danger"} />
-          <span>Host service {healthStatus}</span>
-        </div>
-        <div className="statusRow">
-          <StatusDot status="muted" />
-          <span>Firmware unknown</span>
-        </div>
-      </div>
-    </aside>
-  );
-}
+// The legacy in-console Sidebar was removed when the global app shell took
+// over navigation; sub-page selection now flows through ?page=… read at the
+// top of RadioVisionConsole. The TopBar below is repurposed as an in-content
+// session-control strip.
 
 function TopBar({
   page,
@@ -479,6 +434,15 @@ function TopBar({
     <header className="topbar">
       <div className="breadcrumb">Aether / {page}</div>
       <div className="topbarRight">
+        {/*
+          Quick-jump links to the new routes added in v0.2 (Phase D/E).
+          These intentionally bypass the in-page navSections setPage() flow
+          because they're real routes — back button works, can be popped out,
+          and survive a refresh.
+        */}
+        <a href="/raw" className="iconButton" style={{ textDecoration: "none" }}>Raw</a>
+        <a href="/3d" className="iconButton" style={{ textDecoration: "none" }}>3D</a>
+        <a href="/devices-v2" className="iconButton" style={{ textDecoration: "none" }}>Geometry</a>
         <span className="sessionName">{activeSession?.protocol ?? "No active session"}</span>
         <SourceBadge mode={sourceMode} />
         {activeSession ? (
@@ -1662,14 +1626,3 @@ function BiorhythmStatus({ latest }: { latest: DerivedWindow | null }) {
   );
 }
 
-function navIcon(item: string) {
-  const props = { size: 16 };
-  if (item === "Live Room") return <Home {...props} />;
-  if (item === "Devices") return <HardDrive {...props} />;
-  if (item === "Experiment Console") return <FlaskConical {...props} />;
-  if (item === "Data Explorer") return <Database {...props} />;
-  if (item === "Knowledge Base") return <BookOpen {...props} />;
-  if (item === "Agent Console") return <MessageSquare {...props} />;
-  if (item === "Settings") return <Settings {...props} />;
-  return <Radio {...props} />;
-}

@@ -1,4 +1,13 @@
-import type { CalibrationStatus, LiveMessage, SessionRecord, SourceMode } from "./types";
+import type {
+  CalibrationStatus,
+  LinkDiagnostics,
+  LiveMessage,
+  RawFrame,
+  RoomGeometry,
+  SessionRecord,
+  SourceMode,
+  SubcarrierDiagnostics,
+} from "./types";
 import { devlog, makeRateCounter, startTimer } from "./devlog";
 
 export const apiBase = process.env.NEXT_PUBLIC_AETHER_API ?? "http://127.0.0.1:8000";
@@ -17,29 +26,56 @@ export const wsUrl = process.env.NEXT_PUBLIC_AETHER_WS ?? "ws://127.0.0.1:8000/w
  * Why not generic fetch interceptors? Next.js does not give us one in the
  * client; this wrapper is the equivalent. Every code path that talks to the
  * API must go through it so the log stream stays consistent.
+ *
+ * Log throttling: when uvicorn is offline, every poller flips into a "threw"
+ * loop. Logging each one buries everything else in the console. We dedupe per
+ * opName: the first failure logs an error, the recovery logs an info, and any
+ * repeated failures in between are silent. That keeps the offline → online
+ * transitions visible without drowning out the real signal.
  */
+const lastApiState = new Map<string, "ok" | "down">();
+
+function noteSuccess(opName: string) {
+  if (lastApiState.get(opName) === "down") {
+    devlog.info("api", `${opName} recovered`);
+  }
+  lastApiState.set(opName, "ok");
+}
+
+function noteFailure(opName: string, kind: string, payload: Record<string, unknown>) {
+  if (lastApiState.get(opName) !== "down") {
+    devlog.error("api", `${opName} ${kind} (further failures silenced until recovery)`, payload);
+  }
+  lastApiState.set(opName, "down");
+}
+
 async function rvFetch(url: string, init?: RequestInit, opName: string = "request"): Promise<Response> {
   const method = (init?.method ?? "GET").toUpperCase();
-  const stop = startTimer("api", `${method} ${opName} ${url}`, init?.body ? { hasBody: true } : undefined);
+  const tag = `${method} ${opName}`;
+  const stop = startTimer("api", `${tag} ${url}`, init?.body ? { hasBody: true } : undefined);
   try {
     const response = await fetch(url, init);
     if (!response.ok) {
-      // Read body once, log it, then re-wrap so callers can throw with detail.
       let body = "";
       try { body = await response.text(); } catch { /* swallow */ }
-      stop("error", { status: response.status, statusText: response.statusText, body });
-      // Hand back a synthetic Response-like that already has the body consumed.
-      // Caller paths below check response.ok, so we throw here for clarity.
+      stop("debug", { status: response.status, statusText: response.statusText });
+      noteFailure(opName, `non-2xx (${response.status})`, {
+        status: response.status,
+        statusText: response.statusText,
+        body,
+      });
       throw new Error(`${method} ${url} -> ${response.status} ${response.statusText}: ${body || "<empty body>"}`);
     }
-    stop("info", { status: response.status });
+    stop("debug", { status: response.status });
+    noteSuccess(opName);
     return response;
   } catch (err) {
     if (err instanceof Error && err.message.startsWith(`${method} `)) {
-      // already logged + tagged above
+      // Status error already accounted for above.
       throw err;
     }
-    devlog.error("api", `${method} ${opName} ${url} threw`, { error: err });
+    const message = err instanceof Error ? err.message : String(err);
+    noteFailure(opName, "network/fetch failed", { error: message });
     throw err;
   }
 }
@@ -145,6 +181,59 @@ export async function cancelCalibration(): Promise<CalibrationStatus> {
   return response.json();
 }
 
+export async function getLinkDiagnostics(): Promise<LinkDiagnostics> {
+  const response = await rvFetch(
+    `${apiBase}/diagnostics/link`,
+    { cache: "no-store" },
+    "diagnostics:link"
+  );
+  return response.json();
+}
+
+export async function getSubcarrierDiagnostics(): Promise<SubcarrierDiagnostics> {
+  const response = await rvFetch(
+    `${apiBase}/diagnostics/subcarriers`,
+    { cache: "no-store" },
+    "diagnostics:subcarriers"
+  );
+  return response.json();
+}
+
+export async function getLatestFrames(sessionId: string, n = 50): Promise<{
+  session_id: string;
+  count: number;
+  frames: RawFrame[];
+}> {
+  const response = await rvFetch(
+    `${apiBase}/sessions/${sessionId}/frames/latest?n=${n}`,
+    { cache: "no-store" },
+    `sessions:frames:latest[${sessionId}]`
+  );
+  return response.json();
+}
+
+export async function getRoomGeometry(): Promise<RoomGeometry> {
+  const response = await rvFetch(
+    `${apiBase}/room/geometry`,
+    { cache: "no-store" },
+    "room:geometry:get"
+  );
+  return response.json();
+}
+
+export async function putRoomGeometry(geometry: RoomGeometry): Promise<RoomGeometry> {
+  const response = await rvFetch(
+    `${apiBase}/room/geometry`,
+    {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(geometry),
+    },
+    "room:geometry:put"
+  );
+  return response.json();
+}
+
 /*
  * connectLive owns the /ws/live WebSocket. It auto-reconnects on close with a
  * 2.5s backoff and reports state transitions to the caller via onStatus.
@@ -157,12 +246,36 @@ export async function cancelCalibration(): Promise<CalibrationStatus> {
  *   - one warn line for malformed messages (JSON parse failure) with the raw
  *     payload truncated, so silent corruption does not just disappear
  */
-export function connectLive(onMessage: (message: LiveMessage) => void, onStatus: (status: string) => void) {
+/**
+ * Returned by connectLive(). Callers can re-subscribe at any time to add
+ * topics like "raw_frame" beyond the default "derived_window".
+ */
+export interface LiveConnection {
+  close: () => void;
+  subscribe: (topics: string[]) => void;
+}
+
+export function connectLive(
+  onMessage: (message: LiveMessage) => void,
+  onStatus: (status: string) => void,
+  options: { topics?: string[] } = {}
+): LiveConnection {
   let socket: WebSocket | null = null;
   let stopped = false;
   let retry: ReturnType<typeof setTimeout> | null = null;
   let attempt = 0;
+  let desiredTopics: string[] = options.topics ? [...options.topics] : ["derived_window"];
   const tickRecv = makeRateCounter("ws", "frames received");
+
+  const sendSubscribe = () => {
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    try {
+      socket.send(JSON.stringify({ type: "subscribe", topics: desiredTopics }));
+      devlog.info("ws", `subscribed to topics: ${desiredTopics.join(", ")}`);
+    } catch (err) {
+      devlog.warn("ws", "subscribe send failed", { error: err });
+    }
+  };
 
   const open = () => {
     if (stopped) return;
@@ -174,6 +287,9 @@ export function connectLive(onMessage: (message: LiveMessage) => void, onStatus:
       onStatus("connected");
       devlog.info("ws", `open (attempt ${attempt})`, { url: wsUrl });
       attempt = 0;
+      // Always declare the desired topic list on connect so reconnects
+      // do not silently drop a "raw_frame" subscription.
+      sendSubscribe();
     };
     socket.onclose = (event) => {
       if (stopped) return;
@@ -204,12 +320,16 @@ export function connectLive(onMessage: (message: LiveMessage) => void, onStatus:
 
   open();
 
-  return () => {
-    stopped = true;
-    devlog.info("ws", "client requested disconnect");
-    if (retry) {
-      globalThis.clearTimeout(retry);
-    }
-    socket?.close();
+  return {
+    close: () => {
+      stopped = true;
+      devlog.info("ws", "client requested disconnect");
+      if (retry) globalThis.clearTimeout(retry);
+      socket?.close();
+    },
+    subscribe: (topics: string[]) => {
+      desiredTopics = [...topics];
+      sendSubscribe();
+    },
   };
 }

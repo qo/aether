@@ -8,12 +8,19 @@ from services.dsp.src.calibration import BaselineCalibrator
 
 def test_begin_then_feed_completes_after_target_duration() -> None:
     cal = BaselineCalibrator()
-    cal.begin(duration_seconds=1.0)
+    cal.begin(duration_seconds=5.0)
     period_ns = 50_000_000  # 20 Hz
-    n = 40  # 2 s of frames
+    # Phase B acceptance requires >= 100 frames over a >= target_seconds
+    # window; 120 frames over 6s comfortably clears both gates.
+    n = 120
     completed = False
     for k in range(n):
-        completed = cal.feed(np.array([10.0, 11.0, 12.0]), ts_host_ns=k * period_ns) or completed
+        completed = cal.feed(
+            np.array([10.0, 11.0, 12.0]),
+            ts_host_ns=k * period_ns,
+            rssi_dbm=-50.0,
+            motion_score=0.1,
+        ) or completed
     assert cal.is_calibrated
     assert completed
     assert not cal.is_calibrating

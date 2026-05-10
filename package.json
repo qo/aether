@@ -17,5 +17,8 @@
     "check:no-fake-data": "node scripts/no_nonreal_data_check.mjs",
     "lint": "npm run lint --workspace @aether/web"
   },
-  "devDependencies": {}
+  "dependencies": {
+    "@types/three": "^0.184.1",
+    "three": "^0.184.0"
+  }
 }

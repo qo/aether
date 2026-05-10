@@ -86,15 +86,21 @@ def test_derive_window_with_calibrated_baseline_drops_anomaly_for_quiet_room() -
     period_ns = 50_000_000
     rng = np.random.RandomState(11)
     cal = BaselineCalibrator()
-    cal.begin(duration_seconds=1.0)
-    # Calibration phase: 60 frames of a perfectly stable empty room.
-    for k in range(60):
+    cal.begin(duration_seconds=5.0)
+    # Phase B acceptance: >= 100 frames over >= target_seconds at a usable
+    # rate; 140 frames at 20 Hz over 7 s clears all gates.
+    for k in range(140):
         amp_vec = np.array([60.0 + rng.normal(0, 0.5)] * 32)
-        cal.feed(amp_vec, ts_host_ns=k * period_ns)
+        cal.feed(
+            amp_vec,
+            ts_host_ns=k * period_ns,
+            rssi_dbm=-50.0,
+            motion_score=0.1,
+        )
 
     # Now derive a quiet window - should have low motion and anomaly.
     frames_quiet = [
-        _make_frame(seq=k, ts_ns=(60 + k) * period_ns, iq=_flat_iq(32, 60))
+        _make_frame(seq=k, ts_ns=(140 + k) * period_ns, iq=_flat_iq(32, 60))
         for k in range(40)
     ]
     quiet = derive_window(frames_quiet, calibrator=cal, expected_packet_rate_hz=20.0)

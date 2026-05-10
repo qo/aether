@@ -37,6 +37,16 @@
     "amplitude_mean": { "type": "array", "items": { "type": "number" } },
     "amplitude_std": { "type": "array", "items": { "type": "number" } },
     "phase_unwrapped_mean": { "type": "array", "items": { "type": "number" } },
+    "phase_unwrapped_std": {
+      "type": ["array", "null"],
+      "items": { "type": "number" }
+    },
+    "motion_score_amplitude": { "type": ["number", "null"], "minimum": 0 },
+    "motion_score_phase": { "type": ["number", "null"], "minimum": 0 },
+    "responsive_subcarriers": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 0 }
+    },
     "motion_score": { "type": "number", "minimum": 0 },
     "occupancy_score": { "type": "number", "minimum": 0, "maximum": 1 },
     "respiration_bpm": { "type": ["number", "null"], "minimum": 0 },

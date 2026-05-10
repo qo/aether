@@ -15,12 +15,15 @@ from services.dsp.src.features import derive_window
 from services.dsp.src.preprocessing import iq_array_to_amplitude
 from services.dsp.src.summaries import room_summary
 
+from .link_stats import LinkStats
 from .session_store import SessionStore
 
 logger = logging.getLogger(__name__)
 
 # Default expected packet rate from a healthy two-board ESP32-S3 link with the
 # bundled TX firmware (50 ms cadence -> ~20 Hz CSI callbacks at the receiver).
+# Used until LinkStats reports a stable observed rate, at which point the
+# observed value takes over for quality scoring (see _maybe_adopt_observed_rate).
 DEFAULT_EXPECTED_PACKET_RATE_HZ = 20.0
 
 
@@ -35,12 +38,14 @@ class RuntimeState:
     active_session_id: str | None = None
     running: bool = False
     expected_packet_rate_hz: float = DEFAULT_EXPECTED_PACKET_RATE_HZ
+    expected_rate_source: str = "default"
     last_frame_ts_host_ns: int = 0
     _frames_seen: int = 0
     _windows_emitted: int = 0
     _window_frames: deque[RawCsiFrame] = field(default_factory=lambda: deque(maxlen=40))
     _biorhythm: BiorhythmEstimator = field(default_factory=BiorhythmEstimator)
     _calibrator: BaselineCalibrator = field(default_factory=BaselineCalibrator)
+    link_stats: LinkStats = field(default_factory=LinkStats)
 
     async def publish_frame(self, frame: RawCsiFrame) -> None:
         self.latest_raw = frame
@@ -48,22 +53,48 @@ class RuntimeState:
         self._window_frames.append(frame)
         self.store.append_raw_frame(frame)
         self._frames_seen += 1
+        # Phase A: feed link diagnostics (jitter, observed Hz, RSSI std).
+        self.link_stats.record_frame(
+            ts_host_ns=int(frame.ts_host_ns),
+            rssi_dbm=int(frame.rssi_dbm),
+            noise_floor_dbm=int(frame.noise_floor_dbm),
+            first_word_invalid=bool(frame.first_word_invalid),
+        )
+        self._maybe_adopt_observed_rate()
+
         # Heartbeat: every 100 frames, prove the collector is alive without
         # spamming a line per packet at 20 Hz. Includes derived-window count
         # so you can confirm the DSP stage is keeping up.
         if self._frames_seen % 100 == 0:
+            snap = self.link_stats.snapshot()
             logger.info(
-                "[runtime] collector heartbeat: frames=%d windows=%d buffered=%d",
+                "[runtime] collector heartbeat: frames=%d windows=%d buffered=%d "
+                "obs_hz=%.2f exp_hz=%.2f p50ms=%s p99ms=%s drops=%s",
                 self._frames_seen,
                 self._windows_emitted,
                 len(self._window_frames),
+                snap.observed_packet_rate_hz,
+                self.expected_packet_rate_hz,
+                f"{snap.inter_arrival_p50_ms:.1f}" if snap.inter_arrival_p50_ms else "-",
+                f"{snap.inter_arrival_p99_ms:.1f}" if snap.inter_arrival_p99_ms else "-",
+                snap.firmware_dropped if snap.firmware_dropped is not None else "-",
             )
 
         # Calibration: feed per-frame amplitude vector into the baseline accumulator.
+        # Also pass RSSI + last-known motion so the calibrator can reject
+        # baselines captured during noisy/active windows (Phase B acceptance).
         if self._calibrator.is_calibrating:
             amp = iq_array_to_amplitude(frame.raw_iq_int8)
             if amp.size > 0:
-                self._calibrator.feed(amp, ts_host_ns=int(frame.ts_host_ns))
+                last_motion = (
+                    self.latest_window.motion_score if self.latest_window else None
+                )
+                self._calibrator.feed(
+                    amp,
+                    ts_host_ns=int(frame.ts_host_ns),
+                    rssi_dbm=float(frame.rssi_dbm),
+                    motion_score=last_motion,
+                )
 
         # Bio rhythm wants to know whether the subject is still and whether we
         # have an empty-room baseline so it can apply the stillness gate.
@@ -129,6 +160,49 @@ class RuntimeState:
     def calibration_status(self) -> dict[str, object]:
         return self._calibrator.status()
 
+    def subcarrier_diagnostics(self) -> dict[str, object]:
+        snap = self._calibrator.snapshot()
+        if snap is None:
+            return {
+                "schema_version": "subcarrier_diagnostics.v1",
+                "is_calibrated": False,
+                "subcarrier_count": 0,
+                "edges_dropped": 0,
+                "amplitude_mean": [],
+                "amplitude_std": [],
+                "snr_weights": [],
+                "responsive_indices": [],
+            }
+        # Mirror the edge-drop logic that derive_window applies so the UI
+        # can highlight which subcarriers are "in play" vs trimmed by edge
+        # filtering.
+        from services.dsp.src.preprocessing import drop_edge_subcarriers
+        import numpy as np
+
+        full = np.array(snap.amplitude_mean, dtype=np.float64).reshape(1, -1)
+        if full.size:
+            _, kept = drop_edge_subcarriers(full, edge_fraction=0.06)
+            kept_list = kept.tolist()
+            edges = snap.subcarrier_count - len(kept_list)
+        else:
+            kept_list = []
+            edges = 0
+        responsive = self._calibrator.select_responsive_subcarriers(
+            np.array(snap.amplitude_std, dtype=np.float64),
+            top_k=8,
+        ).tolist()
+        return {
+            "schema_version": "subcarrier_diagnostics.v1",
+            "is_calibrated": True,
+            "subcarrier_count": snap.subcarrier_count,
+            "edges_dropped": int(edges),
+            "kept_indices": kept_list,
+            "responsive_indices": responsive,
+            "amplitude_mean": snap.amplitude_mean,
+            "amplitude_std": snap.amplitude_std,
+            "snr_weights": snap.snr_weights,
+        }
+
     def begin_calibration(self, *, duration_seconds: float = 10.0) -> dict[str, object]:
         if self.latest_raw is None:
             raise RuntimeError("no live frames yet; cannot calibrate")
@@ -144,12 +218,52 @@ class RuntimeState:
         self._calibrator = BaselineCalibrator()
         return self._calibrator.status()
 
+    def record_firmware_heartbeat(
+        self,
+        *,
+        packets_seen: int | None = None,
+        dropped: int | None = None,
+        queue_depth: int | None = None,
+    ) -> None:
+        """Push firmware-side counters from a heartbeat envelope into LinkStats."""
+        self.link_stats.record_heartbeat(
+            packets_seen=packets_seen,
+            dropped=dropped,
+            queue_depth=queue_depth,
+        )
+
+    def _maybe_adopt_observed_rate(self) -> None:
+        """Switch from the default 20 Hz expectation to the measured value
+        once LinkStats has a stable EMA. Idempotent.
+
+        Why: until this fires, ``quality_score`` penalises every frame against
+        an expected_packet_rate_hz that the hardware may not actually deliver.
+        Adopting the observed rate removes that systematic bias.
+        """
+        if self.expected_rate_source == "observed":
+            return
+        if not self.link_stats.is_rate_stable():
+            return
+        observed = self.link_stats.observed_rate_hz()
+        if observed <= 0.5:
+            return
+        previous = self.expected_packet_rate_hz
+        self.expected_packet_rate_hz = float(observed)
+        self.expected_rate_source = "observed"
+        logger.info(
+            "[runtime] adopted observed packet rate: was %.2f Hz (default), now %.2f Hz (measured)",
+            previous,
+            observed,
+        )
+
     async def start_replay(self, *, path: str, packet_rate_hz: float = 20.0) -> None:
         if self.source_task and not self.source_task.done():
             logger.warning("[runtime] start_replay ignored: source task already running")
             return
         self.running = True
         self.expected_packet_rate_hz = packet_rate_hz
+        self.expected_rate_source = "replay_configured"
+        self.link_stats.reset()
         self._biorhythm.reset()
         self._frames_seen = 0
         self._windows_emitted = 0
@@ -173,6 +287,8 @@ class RuntimeState:
         self.running = True
         self.active_session_id = session_id
         self.expected_packet_rate_hz = DEFAULT_EXPECTED_PACKET_RATE_HZ
+        self.expected_rate_source = "default"
+        self.link_stats.reset()
         self._biorhythm.reset()
         self._frames_seen = 0
         self._windows_emitted = 0
@@ -180,10 +296,18 @@ class RuntimeState:
 
         async def run() -> None:
             try:
-                async for frame in read_serial_frames(port=port, baud=baud, session_id=session_id):
+                async for message in read_serial_frames(port=port, baud=baud, session_id=session_id):
                     if not self.running:
                         break
-                    await self.publish_frame(frame)
+                    if isinstance(message, RawCsiFrame):
+                        await self.publish_frame(message)
+                    elif isinstance(message, dict) and message.get("type") == "heartbeat":
+                        # Phase A: firmware-side counters surfaced to LinkStats.
+                        self.record_firmware_heartbeat(
+                            packets_seen=message.get("packets_seen"),
+                            dropped=message.get("dropped"),
+                            queue_depth=message.get("queue_depth"),
+                        )
             except Exception:
                 logger.exception("live source task failed (port=%s)", port)
                 self.running = False

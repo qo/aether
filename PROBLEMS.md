@@ -15,21 +15,15 @@ just strike it through — the file is meant to stay short).
 
 ## 1. Hardware / firmware
 
-### 1.1 Live packet rate is ~6 Hz, target is ~20 Hz
+### 1.1 Live packet rate is ~6 Hz, target is ~20 Hz — instrumentation now landed; root cause TBD
 **Severity:** Major (functional but degraded).
-**Symptom:** `[runtime] collector heartbeat: frames=100 windows=90 buffered=40` over ~17 s; `[ws] sent N derived windows in 5.0s (5.8 /s)`. The TX firmware is documented to emit at 50 ms cadence (~20 Hz) — see `firmware/esp32-s3-tx/main/tx_config.h` and `apps/api/src/services/runtime.py:DEFAULT_EXPECTED_PACKET_RATE_HZ = 20.0`.
-**Root cause (suspected, not confirmed):** Several plausible contributors —
-Wi-Fi link quality (multipath / channel congestion in 2.4 GHz), TX firmware's
-actual transmit interval not matching its config, Windows `pyserial.readline()`
-latency, or a serial buffer flush issue. We have no instrumentation to
-isolate which.
-**Fix sketch:**
-1. Add a TX-side debug log of actual TX cadence (microsecond timestamps).
-2. Measure RX-side packet inter-arrival in `services/collector/src/serial_reader.py`.
-3. If TX cadence is correct, try a Wi-Fi channel scan and pin the TX/RX to a
-   quiet channel.
-4. If the bottleneck is `pyserial`, try `serial.Serial(... timeout=0)` plus a
-   manual `inWaiting()` loop instead of `readline()`.
+**Symptom:** `[runtime] collector heartbeat: frames=100 windows=90 buffered=40` over ~17 s; `[ws] sent N derived windows in 5.0s (5.8 /s)`. The TX firmware is documented to emit at 50 ms cadence (~20 Hz).
+**Status (v0.2):** Phase A instrumentation is in place — `firmware/esp32-s3-tx/main/app_main.c` now logs measured TX cadence (min/avg/max µs) every 200 packets; `firmware/esp32-s3-rx/main/csi_capture.c` counts CSI queue overflows; the host now keeps an EMA-smoothed observed packet rate, RX inter-arrival p50/p90/p99/max histogram, and surfaces all of it via `GET /diagnostics/link` and the Raw Sensor / Devices pages. Once `expected_packet_rate_hz` adopts the observed value the quality score stops being permanently capped at ~0.6.
+**Outstanding:** flash both boards with the new firmware, capture the new heartbeat lines, and pick the right next move from the data:
+1. If TX cadence log shows actual interval >> 50 ms → firmware bug.
+2. If RX p50 inter-arrival ≈ 50 ms but host frames-per-second is much lower → host serial bottleneck (try `serial.Serial(... timeout=0)` + `inWaiting()` loop, or run the collector on Linux/Pi via Ethernet).
+3. If `firmware_dropped > 0` → host not draining fast enough (same fix).
+4. If the link is genuinely slow → Wi-Fi channel scan + pin to quiet channel.
 
 ### 1.2 COM9 (TX board USB endpoint) cannot be opened — PermissionError 13
 **Severity:** Minor (does not block operation; we don't need to read TX).
@@ -88,6 +82,14 @@ rows).
 redundant with the row above.
 
 ---
+
+### 2.4b Live Room console still owns its own sidebar/topbar
+**Severity:** Cosmetic.
+**Status (v0.2):** New routes (`/raw`, `/3d`, `/devices-v2`) use the new shared
+shell (`features/shell/shell-layout.tsx`) with its own sidebar. The legacy
+`/home` view still bundles 1675 lines of `aether-console.tsx`. Splitting it is
+the next chunk of `PLAN_3D_RAW_CALIBRATION.md` §4.2; the new TopBar Quick-jump
+links keep the surfaces accessible in the meantime.
 
 ## 3. Frontend dev-experience hazards
 
@@ -164,7 +166,37 @@ JSON-per-line (`{"ts":..., "level":..., "logger":..., "msg":..., "tag":...}`).
 
 ---
 
-## 6. Things deliberately NOT in scope (per `CLAUDE.md`)
+## 6. Honesty boundaries — what this hardware physically cannot do
+
+These are **not bugs** and not on the roadmap. They are limits of one TX +
+one RX with a single antenna each.
+
+- **Cannot sense the room dimensions.** Length × width × height of the
+  room are properties of the *space*, not the link. The 3D view shows a
+  placeholder until the operator enters real measurements; `is_default`
+  in `GET /room/geometry` is true until a save happens.
+- **Cannot sense TX↔RX distance precisely.** RSSI converted via a log-
+  distance path-loss model (n=3, indoor) gives a ±50% estimate at best.
+  Surfaced as `rssi_implied_distance_m` purely as a sanity check vs the
+  operator's tape measure.
+- **Cannot track the subject's position.** That needs ≥2 RX boards
+  (TDoA) or multiple antennas at one RX (AoA). The Subject Blob in the
+  3D view is at the operator-supplied position; only its *intensity*
+  (motion / occupancy) is sensed.
+- **Cannot identify the subject, infer pose, or extract HRV.** Forbidden
+  by `CLAUDE.md` and unachievable with this hardware regardless.
+- **No ML model.** "Calibration" in this codebase is statistical (per-
+  subcarrier mean / std of an empty room), not a learned classifier.
+
+## 7. Operator-only actions
+
+- **Flashing firmware.** `.\scripts\flash_tx.ps1` and `.\scripts\flash_rx.ps1`
+  must be run by a human with the boards plugged in and ESP-IDF active.
+  Coding agents cannot do this.
+- **Measuring the room.** Tape measure → enter on `/devices-v2` → save.
+- **Linux live-USB OS comparison test.** Plan §6.1 — out of repo.
+
+## 8. Things deliberately NOT in scope (per `CLAUDE.md`)
 
 These are *not* problems — they're scope boundaries you might wish were
 features. Listed so nobody files an "implement HRV" ticket.

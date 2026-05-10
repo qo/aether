@@ -52,6 +52,27 @@ In the UI:
 4. Hold the room empty → **Calibrate (10 s)** in the Baseline Calibration
    card. Without baseline, occupancy reads "uncalibrated".
 
+### v0.2 routes
+
+The legacy console at `/home` is unchanged. Three new diagnostic surfaces are
+one click away in its top bar:
+
+| Route | What it shows |
+|---|---|
+| `/raw` | Per-frame inspector, live amplitude + phase spectrograms, link diagnostics, subcarrier health (Phase A + B surfaces). |
+| `/3d` | 3D wave view: operator-supplied room/TX/RX/subject geometry, real-time pulses driven by actual TX packet timing, subcarrier carpet, motion-modulated subject blob. Pop-out window via the HUD button. |
+| `/devices-v2` | Link state + the room geometry editor (2D drag floorplan + numeric fields). Save here before opening `/3d`. |
+
+### Validating accuracy from a recorded session
+
+```powershell
+python scripts\validate_accuracy.py data\recordings\<session-id>.jsonl
+```
+
+Replays a JSONL through the DSP and asserts sanity bounds (rate floor,
+quality floor, motion non-zero). Returns non-zero on failure so it can be
+added to CI later.
+
 ### No hardware? Replay mode
 
 ```powershell
@@ -142,9 +163,16 @@ GitHub Actions (`.github/workflows/ci.yml`) runs all three on push.
 
 ## Project status
 
-**Current.** Live CSI capture, storage, replay, real-time UI, controlled
-experiments, structured logging, baseline calibration, FFT/ACF respiration
-research-only readout. Single-room, single-subject, single-link.
+**Current (v0.2).** Live CSI capture, storage, replay, real-time UI,
+controlled experiments, structured logging, hardened baseline calibration
+(acceptance gates + responsive-subcarrier feedback loop + per-frame phase
+detrend), FFT/ACF respiration research-only readout. **New:** end-to-end
+link instrumentation (`/diagnostics/link`), per-subcarrier introspection
+(`/diagnostics/subcarriers`), raw-frame REST + WebSocket subscribe topic,
+operator-supplied room geometry, Raw Sensor diagnostics page, and a 3D
+wave-view route that animates real packet timing and subcarrier amplitude
+in operator-supplied geometry — pop-out window supported. Single-room,
+single-subject, single-link.
 
 **V1 / later.** See `docs/ROADMAP.md` and `PROBLEMS.md` for what's scaffolded
 but not wired (agent + KB) and what's known broken/unfinished.

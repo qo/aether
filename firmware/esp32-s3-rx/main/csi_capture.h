@@ -22,3 +22,7 @@ typedef struct {
 
 void rv_csi_init(void);
 bool rv_csi_receive(rv_csi_packet_t *packet, uint32_t timeout_ms);
+
+// Telemetry — read by the serial task for heartbeat lines.
+uint32_t rv_csi_dropped_count(void);
+uint32_t rv_csi_queue_pending(void);

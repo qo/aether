@@ -4,15 +4,18 @@ Pipeline (per derived window of N frames):
 
     1. Build a (T, S) amplitude matrix from raw I/Q.
     2. Drop edge / null-DC subcarriers.
-    3. Hampel-filter each subcarrier in time to suppress impulsive glitches
-       (the kind that show up when ``first_word_invalid`` packets sneak through
-       or the radio renormalises gain).
+    3. Hampel-filter each subcarrier in time to suppress impulsive glitches.
+       Window length is now derived from the actual packet rate so a 350 ms
+       half-window is constant in time, not in frames (Phase B fix).
     4. Subtract the per-subcarrier baseline mean (if a baseline has been
        calibrated, otherwise centre on the window mean).
     5. Detrend each subcarrier and bandpass 0.05-5 Hz so we keep
        respiration / body-motion energy and reject DC drift + HF noise.
     6. Compute motion_score, anomaly_score, occupancy_score from the
        conditioned signal, weighted by per-subcarrier SNR when available.
+       Phase B: motion is split into amplitude and phase contributions, and
+       only "responsive" subcarriers (selected by the calibrator) drive the
+       headline number when a baseline exists.
     7. Compute link diagnostics: packet rate vs expected, packet-loss ratio
        from sequence gaps, inter-arrival jitter, first_word_invalid ratio.
 
@@ -38,6 +41,7 @@ from .preprocessing import (
     drop_edge_subcarriers,
     frames_to_amplitude_matrix,
     frames_to_phase_matrix,
+    remove_linear_phase_per_frame,
 )
 
 # Body-motion / respiration band of interest. The lower edge has to be small
@@ -45,6 +49,23 @@ from .preprocessing import (
 # AGC drift; the upper edge keeps gross body motion and rejects high-frequency
 # CSI noise.
 MOTION_BAND_HZ: tuple[float, float] = (0.05, 5.0)
+
+# Phase B: Hampel half-window in *time* (not frames). At 20 Hz this is 7
+# samples (the old hardcoded value); at 6 Hz it shrinks so we don't smear
+# real motion edges across ~1.2 s of context.
+HAMPEL_HALF_WINDOW_S: float = 0.175
+
+# Phase B: relative weight of phase-derived motion vs amplitude-derived
+# motion. Phase is noisier under CFO/STO drift but reacts to body motion
+# the amplitude path misses; small weight is conservative until phase
+# calibration matures.
+MOTION_PHASE_WEIGHT: float = 0.15
+MOTION_AMP_WEIGHT: float = 1.0 - MOTION_PHASE_WEIGHT
+
+import logging as _logging  # noqa: E402
+
+_logger = _logging.getLogger(__name__)
+_warned_bandpass_clamp: bool = False
 
 
 @dataclass(frozen=True)
@@ -79,7 +100,11 @@ def derive_window(
         return _empty_window(frames, diag)
 
     # Hampel along the time axis kills single-frame spikes per subcarrier.
-    amp_filtered = hampel_filter_columns(amp_matrix, window=7, n_sigmas=3.0)
+    # Phase B: derive the half-window from the actual sample rate so the
+    # filter's *time* footprint stays constant across slow/fast links.
+    sample_rate_hint = max(1.0, diag.packet_rate_hz or 1.0)
+    hampel_half = max(2, int(round(HAMPEL_HALF_WINDOW_S * sample_rate_hint)))
+    amp_filtered = hampel_filter_columns(amp_matrix, window=hampel_half, n_sigmas=3.0)
 
     # Per-subcarrier mean (used by the calibrator and as the "amplitude_mean"
     # surface readout) is computed before bandpass so it represents the true
@@ -99,32 +124,90 @@ def derive_window(
     # the firmware actually delivered to us in this window, not what we wanted.
     detrended = detrend_columns(centred)
     sample_rate_hz = max(1.0, diag.packet_rate_hz or 1.0)
+    high_hz = min(MOTION_BAND_HZ[1], sample_rate_hz * 0.4)
+    global _warned_bandpass_clamp
+    if high_hz < MOTION_BAND_HZ[1] and not _warned_bandpass_clamp:
+        _warned_bandpass_clamp = True
+        _logger.warning(
+            "[features] bandpass high edge clamped to %.2f Hz at %.2f Hz sample rate; "
+            "motion energy above %.2f Hz is not captured. Investigate the link "
+            "(see /diagnostics/link).",
+            high_hz,
+            sample_rate_hz,
+            high_hz,
+        )
     conditioned = butter_filter_columns(
         detrended,
         sample_rate_hz=sample_rate_hz,
         low_hz=MOTION_BAND_HZ[0],
-        high_hz=min(MOTION_BAND_HZ[1], sample_rate_hz * 0.4),
+        high_hz=high_hz,
         order=3,
     )
 
     # SNR-weighted motion / anomaly scores. Subcarriers that wobbled in the
     # empty-room baseline get downweighted; clean ones drive the readout.
+    # Phase B: when a baseline is available, also restrict to the responsive
+    # subset so motion isn't diluted by inert subcarriers.
     weights = None
+    responsive_indices_local: list[int] = []
     if calibrator is not None:
         weights = calibrator.snr_weights()
     if weights is None or weights.size != conditioned.shape[1]:
         weights = np.ones(conditioned.shape[1], dtype=np.float64) / max(1, conditioned.shape[1])
 
-    # Motion score: weighted RMS of conditioned per-subcarrier signal.
+    # Phase B: amplitude-derived motion using the responsive subset (when
+    # the calibrator can name one — needs a baseline AND non-trivial motion
+    # in this window).
     rms_per_col = np.sqrt((conditioned ** 2).mean(axis=0))
-    motion_score = float(np.dot(rms_per_col, weights))
+    if calibrator is not None and calibrator.is_calibrated:
+        responsive = calibrator.select_responsive_subcarriers(rms_per_col, top_k=8)
+        responsive = responsive[(responsive >= 0) & (responsive < conditioned.shape[1])]
+        if responsive.size:
+            responsive_indices_local = responsive.tolist()
+            sub_rms = rms_per_col[responsive]
+            sub_w = weights[responsive]
+            sub_w = sub_w / max(sub_w.sum(), 1e-9)
+            motion_score_amp = float(np.dot(sub_rms, sub_w))
+        else:
+            motion_score_amp = float(np.dot(rms_per_col, weights))
+    else:
+        motion_score_amp = float(np.dot(rms_per_col, weights))
+
+    # Phase B: phase-derived motion. Phase wobble across the window is a
+    # different witness to body motion than amplitude variation; we use
+    # column std after unwrap as a cheap proxy. When CFO/STO calibration
+    # ships (Phase B step 4b in the plan), this becomes substantially
+    # less noisy and the MOTION_PHASE_WEIGHT can climb.
+    phase_matrix_full = frames_to_phase_matrix(frames)
+    if phase_matrix_full.size and phase_matrix_full.shape[1] >= amp_matrix.shape[1]:
+        full_width = amp_matrix_full.shape[1]
+        drop = (full_width - amp_matrix.shape[1]) // 2
+        phase_trim = phase_matrix_full[:, drop : drop + amp_matrix.shape[1]]
+        phase_corrected = remove_linear_phase_per_frame(phase_trim)
+        phase_std_per_col = phase_corrected.std(axis=0)
+        phase_mean = phase_corrected.mean(axis=0).tolist()
+        if responsive_indices_local:
+            sub_p = phase_std_per_col[np.array(responsive_indices_local)]
+            motion_score_phase = float(sub_p.mean())
+        else:
+            motion_score_phase = float(phase_std_per_col.mean())
+        phase_std_list = phase_std_per_col.tolist()
+    else:
+        phase_mean = [0.0] * amp_matrix.shape[1]
+        phase_std_list = [0.0] * amp_matrix.shape[1]
+        motion_score_phase = 0.0
+
+    # Combined motion: weighted sum. Phase weight stays small until phase
+    # calibration improves SNR.
+    motion_score = float(
+        MOTION_AMP_WEIGHT * motion_score_amp + MOTION_PHASE_WEIGHT * motion_score_phase
+    )
 
     # Anomaly score: weighted L2 distance per-subcarrier mean from baseline.
     if calibrator is not None and calibrator.is_calibrated:
         baseline_mean = calibrator.baseline_amplitude()
         # Re-trim baseline to match the columns we kept.
         if baseline_mean is not None and baseline_mean.size >= amp_matrix.shape[1]:
-            # Apply same trimming as drop_edge_subcarriers used.
             full_width = amp_matrix_full.shape[1]
             drop = (full_width - amp_matrix.shape[1]) // 2
             base_trimmed = baseline_mean[drop : drop + amp_matrix.shape[1]]
@@ -148,13 +231,8 @@ def derive_window(
     else:
         occupancy_score = float(min(1.0, max(0.0, anomaly_score / 18.0)))
 
-    # Phase mean - kept for spectral inspection in the UI.
-    phase_matrix = frames_to_phase_matrix(frames)
-    if phase_matrix.size and phase_matrix.shape[1] >= amp_matrix.shape[1]:
-        phase_trim = phase_matrix[:, : amp_matrix.shape[1]]
-        phase_mean = phase_trim.mean(axis=0).tolist()
-    else:
-        phase_mean = [0.0] * amp_matrix.shape[1]
+    # phase_mean / phase_std were computed above in the motion block — they
+    # share the same matrix so we don't re-run frames_to_phase_matrix here.
 
     # Composite quality score: weights packet-rate adequacy, frame validity,
     # RSSI stability, and a jitter penalty.
@@ -193,7 +271,11 @@ def derive_window(
         amplitude_mean=amplitude_mean.tolist(),
         amplitude_std=amplitude_std_raw.tolist(),
         phase_unwrapped_mean=phase_mean,
+        phase_unwrapped_std=phase_std_list,
         motion_score=motion_score,
+        motion_score_amplitude=motion_score_amp,
+        motion_score_phase=motion_score_phase,
+        responsive_subcarriers=responsive_indices_local,
         occupancy_score=occupancy_score,
         anomaly_score=anomaly_score,
         quality_score=quality_score,

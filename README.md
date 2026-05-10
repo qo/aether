@@ -6,7 +6,7 @@ packet over USB; a Python collector + DSP pipeline turns those frames into
 motion / occupancy / signal-quality / (research-only) respiration windows; a
 Next.js console renders them in real time.
 
-No camera. No microphone. No cloud. No identity, emotion, or medical claims.
+No camera. No microphone. No cloud. No identity Concerns.
 
 ```
   ESP32-S3 TX  )))  Wi-Fi 2.4 GHz multipath  (((  ESP32-S3 RX

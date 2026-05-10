@@ -1337,3 +1337,25 @@ pre {
   text-transform: uppercase;
   letter-spacing: 0.08em;
 }
+
+.resourceLinks {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: center;
+  width: 100%;
+  text-align: center;
+}
+
+.resourceLinks a {
+  color: var(--text);
+  text-decoration: none;
+  font-size: 14px;
+  display: block;
+}
+
+.resourceLinks a:hover {
+  color: var(--text-strong);
+  text-decoration: underline;
+}
+

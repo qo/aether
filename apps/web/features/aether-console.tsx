@@ -2281,6 +2281,19 @@ function SettingsPage() {
       <Card title="Operator Notes">
         <EmptyState title="No hardware selected" message="Set serial environment variables and use the Devices page to confirm host status." />
       </Card>
+      <Card title="Help & Resources">
+        <div className="resourceLinks">
+          <a href="https://github.com/qo/aether/blob/main/docs/SETUP.md" target="_blank" rel="noopener noreferrer">
+            Setup Guide
+          </a>
+          <a href="https://github.com/qo/aether/blob/main/docs/DEBUGGING.md" target="_blank" rel="noopener noreferrer">
+            Debugging Guide
+          </a>
+          <a href="https://github.com/qo/aether/blob/main/README.md" target="_blank" rel="noopener noreferrer">
+            Project README
+          </a>
+        </div>
+      </Card>
     </section>
   );
 }

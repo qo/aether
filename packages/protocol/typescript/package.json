@@ -1,0 +1,11 @@
+{
+  "name": "@aether/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "test": "node ../../../tests/e2e/protocol-schema.test.mjs"
+  }
+}

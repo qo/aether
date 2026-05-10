@@ -1,0 +1,34 @@
+# Keep line endings sane across Windows / Linux / macOS.
+# Default: text files normalised to LF in the repo, native on checkout.
+* text=auto eol=lf
+
+# Shell + Python must always be LF (CRLF in *.sh breaks the shebang).
+*.sh        text eol=lf
+*.py        text eol=lf
+*.mjs       text eol=lf
+*.js        text eol=lf
+*.ts        text eol=lf
+*.tsx       text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.toml      text eol=lf
+*.css       text eol=lf
+
+# PowerShell prefers CRLF (consistent with Windows tooling).
+*.ps1       text eol=crlf
+
+# Binary / opaque - do not touch.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.bin       binary
+*.elf       binary
+*.uf2       binary
+*.sqlite    binary
+
+# Anything in firmware build trees is generated and shouldn't be diffed.
+firmware/**/build/** -diff

@@ -1,0 +1,31 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+.next/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+*.egg-info/
+.env
+.env.local
+# Claude Code per-user state (project settings live in .claude/settings.json
+# only if you intentionally check that one in; settings.local.json is local).
+.claude/settings.local.json
+data/recordings/*
+!data/recordings/.gitkeep
+data/exports/*
+!data/exports/.gitkeep
+*.duckdb
+*.sqlite
+*.sqlite3
+sdkconfig
+sdkconfig.old
+managed_components/
+# ESP-IDF build trees (each ~145 MB on dev machines) - belt-and-suspenders
+# alongside the generic build/ above, since some IDFs use other names too.
+firmware/**/build/

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aether.local/schemas/experiment_event.v1.json",
+  "title": "Experiment Event",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "session_id",
+    "event_id",
+    "event_type",
+    "ts_host_ns",
+    "source_mode"
+  ],
+  "properties": {
+    "schema_version": { "const": "experiment_event.v1" },
+    "session_id": { "type": "string", "minLength": 1 },
+    "event_id": { "type": "string", "minLength": 1 },
+    "event_type": {
+      "enum": [
+        "session_started",
+        "session_stopped",
+        "label_added",
+        "empty_room",
+        "person_entered",
+        "person_exited",
+        "cross_los",
+        "sit_still",
+        "wave_hand",
+        "breathing_trial",
+        "distance_changed",
+        "orientation_changed"
+      ]
+    },
+    "ts_host_ns": { "type": "integer", "minimum": 0 },
+    "label": { "type": ["string", "null"] },
+    "notes": { "type": ["string", "null"] },
+    "metadata": { "type": "object", "additionalProperties": true },
+    "source_mode": { "enum": ["LIVE", "REPLAY"] }
+  },
+  "additionalProperties": false
+}
